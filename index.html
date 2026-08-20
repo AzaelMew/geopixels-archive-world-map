@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>GeoPixels archive</title>
-  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.css">
   <style>
     html,body,#map{height:100%;margin:0} body{font:14px system-ui,sans-serif}
     #controls{position:absolute;z-index:2;top:10px;left:10px;display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:6px;background:#fffffff0;box-shadow:0 1px 5px #0005}
@@ -14,34 +14,85 @@
 <body>
   <div id="map"></div>
   <div id="controls"><strong>GeoPixels</strong><label>Version <select id="version"></select></label><span id="status">Loading…</span></div>
-  <script src="https://unpkg.com/maplibre-gl@5.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
+  <script src="/pixel-tile-layer.js"></script>
   <script>
+    const maxDataZoom=13;
     const params=new URLSearchParams(location.search);
-    const pixelPerfectZoom=12.5;
-    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),style:{version:8,sources:{osm:{type:'raster',tiles:['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png','https://b.tile.openstreetmap.org/{z}/{x}/{y}.png','https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors'}},layers:[{id:'osm',type:'raster',source:'osm'}]}});
-    map.addControl(new maplibregl.NavigationControl());
     const select=document.querySelector('#version'),status=document.querySelector('#status');
-    function updateResampling(){
-      if(!map.getLayer('geopixels'))return;
-      const resampling=map.getZoom()>=pixelPerfectZoom?'nearest':'linear';
-      if(map.getPaintProperty('geopixels','raster-resampling')!==resampling)map.setPaintProperty('geopixels','raster-resampling',resampling);
+    let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0;
+    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:false,style:{version:8,sources:{osm:{type:'raster',tiles:['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png','https://b.tile.openstreetmap.org/{z}/{x}/{y}.png','https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors'}},layers:[{id:'osm',type:'raster',source:'osm'}]}});
+    map.addControl(new maplibregl.NavigationControl());
+
+    const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
+    function lngToTileX(lng,z){return Math.floor((lng+180)/360*Math.pow(2,z))}
+    function latToTileY(lat,z){
+      const rad=clamp(lat,-85.05112878,85.05112878)*Math.PI/180;
+      return Math.floor((1-Math.log(Math.tan(rad)+1/Math.cos(rad))/Math.PI)/2*Math.pow(2,z));
     }
+    function tileLng(x,z){return x/Math.pow(2,z)*360-180}
+    function tileLat(y,z){const n=Math.PI-2*Math.PI*y/Math.pow(2,z);return 180/Math.PI*Math.atan(Math.sinh(n))}
+    function tileCorners(x,y,z){
+      const west=tileLng(x,z),east=tileLng(x+1,z),north=tileLat(y,z),south=tileLat(y+1,z);
+      return [[west,south],[east,south],[east,north],[west,north]];
+    }
+
+    async function fetchTile(version,z,x,y,generation){
+      const response=await fetch(`/tiles/${version}/${z}/${x}/${y}.png`);
+      if(response.status===404)return null;
+      if(!response.ok)throw new Error(`Tile ${z}/${x}/${y}: ${response.status}`);
+      const bitmap=await createImageBitmap(await response.blob(),{imageOrientation:'flipY'});
+      if(generation!==refreshGeneration){bitmap.close();return null}
+      return {key:`${version}/${z}/${x}/${y}`,bitmap,corners:tileCorners(x,y,z)};
+    }
+
+    async function refreshTiles(){
+      if(!pixelTileLayer||!archiveVersion)return;
+      const generation=++refreshGeneration;
+      const z=clamp(Math.floor(map.getZoom()),0,maxDataZoom),n=Math.pow(2,z),bounds=map.getBounds();
+      const minX=clamp(lngToTileX(bounds.getWest(),z)-1,0,n-1),maxX=clamp(lngToTileX(bounds.getEast(),z)+1,0,n-1);
+      const minY=clamp(latToTileY(bounds.getNorth(),z)-1,0,n-1),maxY=clamp(latToTileY(bounds.getSouth(),z)+1,0,n-1);
+      const active=new Set(),jobs=[];
+      for(let x=minX;x<=maxX;x++)for(let y=minY;y<=maxY;y++){
+        const key=`${archiveVersion}/${z}/${x}/${y}`;
+        active.add(key);
+        if(!pixelTileLayer.hasTile(key))jobs.push(fetchTile(archiveVersion,z,x,y,generation).catch(error=>{console.error(error);return null}));
+      }
+      const loaded=await Promise.all(jobs);
+      if(generation!==refreshGeneration){for(const tile of loaded)if(tile)tile.bitmap.close();return}
+      for(const tile of loaded)if(tile){pixelTileLayer.setTile(tile.key,tile.bitmap,tile.corners);tile.bitmap.close()}
+      for(const key of [...pixelTileLayer.tiles.keys()])if(!active.has(key))pixelTileLayer.removeTile(key);
+    }
+
     function showVersion(id){
-      if(map.getLayer('geopixels'))map.removeLayer('geopixels');
-      if(map.getSource('geopixels'))map.removeSource('geopixels');
-      map.addSource('geopixels',{type:'raster',tiles:[`${location.origin}/tiles/${id}/{z}/{x}/{y}.png`],tileSize:256,minzoom:0,maxzoom:13});
-      map.addLayer({id:'geopixels',type:'raster',source:'geopixels',paint:{'raster-fade-duration':0,'raster-resampling':'nearest'}});
-      updateResampling();
-      params.set('version',id); history.replaceState(null,'',`${location.pathname}?${params}`);
+      archiveVersion=String(id);refreshGeneration++;
+      if(pixelTileLayer)pixelTileLayer.clear();
+      params.set('version',archiveVersion);history.replaceState(null,'',`${location.pathname}?${params}`);
+      refreshTiles();
     }
-    fetch('/api/versions').then(r=>r.json()).then(versions=>{
-      if(!versions.length)throw new Error('No versions ingested');
-      for(const v of versions){const o=document.createElement('option');o.value=v.id;o.textContent=`${v.label} (${v.eventCount.toLocaleString()} events)`;select.append(o)}
-      select.value=params.get('version')||versions.at(-1).id; showVersion(select.value); status.textContent='';
-      select.onchange=()=>showVersion(select.value);
-    }).catch(e=>status.textContent=e.message);
-    map.on('zoom',updateResampling);
-    map.on('moveend',()=>{const c=map.getCenter();params.set('lng',c.lng.toFixed(6));params.set('lat',c.lat.toFixed(6));params.set('zoom',map.getZoom().toFixed(2));history.replaceState(null,'',`${location.pathname}?${params}`)});
+    function updateUrl(){
+      const c=map.getCenter();params.set('lng',c.lng.toFixed(6));params.set('lat',c.lat.toFixed(6));params.set('zoom',map.getZoom().toFixed(2));
+      history.replaceState(null,'',`${location.pathname}?${params}`);
+    }
+
+    map.on('style.load',()=>{
+      map.setProjection({type:'mercator'});
+      if(pixelTileLayer&&!map.getLayer(pixelTileLayer.id)){pixelTileLayer.clear();map.addLayer(pixelTileLayer);refreshTiles()}
+    });
+    map.on('load',async()=>{
+      pixelTileLayer=new PixelTileLayer('pixel-tiles');
+      pixelTileLayer.softness=1.0;
+      map.addLayer(pixelTileLayer);
+      try{
+        const response=await fetch('/api/versions'),versions=await response.json();
+        if(!versions.length)throw new Error('No versions ingested');
+        for(const v of versions){const option=document.createElement('option');option.value=v.id;option.textContent=`${v.label} (${v.eventCount.toLocaleString()} events)`;select.append(option)}
+        select.value=params.get('version')||versions.at(-1).id;showVersion(select.value);select.onchange=()=>showVersion(select.value);status.textContent='';
+      }catch(error){status.textContent=error.message}
+    });
+    map.on('moveend',refreshTiles);
+    map.on('zoomend',refreshTiles);
+    map.on('moveend',updateUrl);
   </script>
 </body>
 </html>

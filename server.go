@@ -14,6 +14,9 @@ import (
 //go:embed index.html
 var viewerHTML []byte
 
+//go:embed pixel-tile-layer.js
+var pixelTileLayerJS []byte
+
 type Version struct {
 	ID            int64  `json:"id"`
 	Label         string `json:"label"`
@@ -28,6 +31,11 @@ func (v Version) IDString() string { return strconv.FormatInt(v.ID, 10) }
 
 func NewHandler(archive *Archive) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /pixel-tile-layer.js", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write(pixelTileLayerJS)
+	})
 	mux.HandleFunc("GET /api/versions", func(w http.ResponseWriter, _ *http.Request) {
 		rows, err := archive.DB.Query(`SELECT id,label,timestamp,source,event_count,declared_count,deletion_count
 			FROM versions ORDER BY timestamp,id`)

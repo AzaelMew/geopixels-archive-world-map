@@ -71,17 +71,26 @@ func TestColorAndLowerZoomMajorityPreserveTransparency(t *testing.T) {
 	}
 }
 
-func TestViewerSwitchesRasterResamplingByZoom(t *testing.T) {
+func TestViewerUsesOfficialPixelTileLayer(t *testing.T) {
 	html := string(viewerHTML)
 	for _, fragment := range []string{
-		"const pixelPerfectZoom=12.5",
-		"map.getZoom()>=pixelPerfectZoom?'nearest':'linear'",
-		"map.setPaintProperty('geopixels','raster-resampling',resampling)",
-		"map.on('zoom',updateResampling)",
+		"maplibre-gl@5.9.0",
+		"<script src=\"/pixel-tile-layer.js\"></script>",
+		"new PixelTileLayer('pixel-tiles')",
+		"pixelTileLayer.softness=1.0",
+		"pixelTileLayer.setTile(",
+		"imageOrientation:'flipY'",
+		"map.on('moveend',refreshTiles)",
 	} {
 		if !strings.Contains(html, fragment) {
-			t.Fatalf("viewer is missing zoom resampling behavior %q", fragment)
+			t.Fatalf("viewer is missing official GPU tile behavior %q", fragment)
 		}
+	}
+	if strings.Contains(html, "raster-resampling") {
+		t.Fatal("viewer still uses MapLibre raster resampling instead of PixelTileLayer")
+	}
+	if strings.Contains(html, "||!map.loaded()") {
+		t.Fatal("refreshTiles cannot wait for map.loaded() inside the map load handler")
 	}
 }
 
@@ -155,6 +164,17 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	var metadata []Version
 	if err := json.Unmarshal(versions.Body.Bytes(), &metadata); err != nil || len(metadata) != 1 || metadata[0].Label != "2026-01-02" {
 		t.Fatalf("versions JSON = %s err=%v", versions.Body.String(), err)
+	}
+
+	layerScript := httptest.NewRecorder()
+	handler.ServeHTTP(layerScript, httptest.NewRequest(http.MethodGet, "/pixel-tile-layer.js", nil))
+	if layerScript.Code != http.StatusOK || layerScript.Header().Get("Content-Type") != "text/javascript; charset=utf-8" {
+		t.Fatalf("PixelTileLayer response: status=%d type=%q", layerScript.Code, layerScript.Header().Get("Content-Type"))
+	}
+	for _, fragment := range []string{"uniform float u_texelsPerPixel", "gl.LINEAR", "class PixelTileLayer"} {
+		if !strings.Contains(layerScript.Body.String(), fragment) {
+			t.Fatalf("PixelTileLayer script is missing %q", fragment)
+		}
 	}
 
 	tile := httptest.NewRecorder()

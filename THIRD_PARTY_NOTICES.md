@@ -3,7 +3,7 @@
 This MVP was built after tracing these upstream projects:
 
 - **Hugi-R/wplace-archive-world-map** — SQLite tile storage, changed-tile snapshots, majority non-transparent zoom merging, HTTP PNG serving, and MapLibre version-selection flow. MIT License, Copyright (c) 2025 Hugo Roussel.
-- **AntCDev/GeoPixelsFront** — GeoPixels EPSG:3857 grid placement, 25-metre cell centers, RGB integer format, `-1` deletion semantics, Y orientation, and sync-tile protocol reference. MIT License, Copyright (c) 2026 GeoPixels.
+- **AntCDev/GeoPixelsFront / geopixels.net** — GeoPixels EPSG:3857 grid placement, colour/deletion protocol, and `pixel-tile-layer.js`. The live GPU layer is included with the owner's permission under the project's MIT License, Copyright (c) 2026 GeoPixels.
 - **pixelcontools/monitor** — inspected as a protocol/WebP reference only. The cloned repository had no license file, so no code was copied from it.
 
 The MIT notices for the two reused/reference implementations follow.
