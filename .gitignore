@@ -1,6 +1,7 @@
 .upstream/
 data/
 geopixels-archive
+geopixels-archive-world-map
 *.db
 *.db-shm
 *.db-wal
