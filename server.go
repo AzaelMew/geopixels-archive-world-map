@@ -1,0 +1,95 @@
+package main
+
+import (
+	"database/sql"
+	_ "embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+//go:embed index.html
+var viewerHTML []byte
+
+type Version struct {
+	ID            int64  `json:"id"`
+	Label         string `json:"label"`
+	Timestamp     int64  `json:"timestamp"`
+	Source        string `json:"source"`
+	EventCount    int    `json:"eventCount"`
+	DeclaredCount int    `json:"declaredCount"`
+	Deletions     int    `json:"deletions"`
+}
+
+func (v Version) IDString() string { return strconv.FormatInt(v.ID, 10) }
+
+func NewHandler(archive *Archive) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/versions", func(w http.ResponseWriter, _ *http.Request) {
+		rows, err := archive.DB.Query(`SELECT id,label,timestamp,source,event_count,declared_count,deletion_count
+			FROM versions ORDER BY timestamp,id`)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		versions := []Version{}
+		for rows.Next() {
+			var version Version
+			if err := rows.Scan(&version.ID, &version.Label, &version.Timestamp, &version.Source, &version.EventCount, &version.DeclaredCount, &version.Deletions); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			versions = append(versions, version)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(versions)
+	})
+	mux.HandleFunc("GET /tiles/{version}/{z}/{x}/{file}", func(w http.ResponseWriter, r *http.Request) {
+		version, err := strconv.ParseInt(r.PathValue("version"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid version", http.StatusBadRequest)
+			return
+		}
+		file := r.PathValue("file")
+		if !strings.HasSuffix(file, ".png") {
+			http.NotFound(w, r)
+			return
+		}
+		coordinates := make([]int, 3)
+		for i, value := range []string{r.PathValue("z"), r.PathValue("x"), strings.TrimSuffix(file, ".png")} {
+			coordinates[i], err = strconv.Atoi(value)
+			if err != nil {
+				http.Error(w, "invalid tile coordinate", http.StatusBadRequest)
+				return
+			}
+		}
+		data, err := archive.GetTile(version, coordinates[0], coordinates[1], coordinates[2])
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		etag := fmt.Sprintf(`"%d-%d-%d-%d"`, version, coordinates[0], coordinates[1], coordinates[2])
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	})
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(viewerHTML)
+	})
+	return mux
+}

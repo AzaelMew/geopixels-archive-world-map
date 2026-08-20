@@ -1,0 +1,6 @@
+.upstream/
+data/
+geopixels-archive
+*.db
+*.db-shm
+*.db-wal
