@@ -17,14 +17,21 @@
   <script src="https://unpkg.com/maplibre-gl@5.7.1/dist/maplibre-gl.js"></script>
   <script>
     const params=new URLSearchParams(location.search);
+    const pixelPerfectZoom=12.5;
     const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),style:{version:8,sources:{osm:{type:'raster',tiles:['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png','https://b.tile.openstreetmap.org/{z}/{x}/{y}.png','https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors'}},layers:[{id:'osm',type:'raster',source:'osm'}]}});
     map.addControl(new maplibregl.NavigationControl());
     const select=document.querySelector('#version'),status=document.querySelector('#status');
+    function updateResampling(){
+      if(!map.getLayer('geopixels'))return;
+      const resampling=map.getZoom()>=pixelPerfectZoom?'nearest':'linear';
+      if(map.getPaintProperty('geopixels','raster-resampling')!==resampling)map.setPaintProperty('geopixels','raster-resampling',resampling);
+    }
     function showVersion(id){
       if(map.getLayer('geopixels'))map.removeLayer('geopixels');
       if(map.getSource('geopixels'))map.removeSource('geopixels');
       map.addSource('geopixels',{type:'raster',tiles:[`${location.origin}/tiles/${id}/{z}/{x}/{y}.png`],tileSize:256,minzoom:0,maxzoom:13});
       map.addLayer({id:'geopixels',type:'raster',source:'geopixels',paint:{'raster-fade-duration':0,'raster-resampling':'nearest'}});
+      updateResampling();
       params.set('version',id); history.replaceState(null,'',`${location.pathname}?${params}`);
     }
     fetch('/api/versions').then(r=>r.json()).then(versions=>{
@@ -33,6 +40,7 @@
       select.value=params.get('version')||versions.at(-1).id; showVersion(select.value); status.textContent='';
       select.onchange=()=>showVersion(select.value);
     }).catch(e=>status.textContent=e.message);
+    map.on('zoom',updateResampling);
     map.on('moveend',()=>{const c=map.getCenter();params.set('lng',c.lng.toFixed(6));params.set('lat',c.lat.toFixed(6));params.set('zoom',map.getZoom().toFixed(2));history.replaceState(null,'',`${location.pathname}?${params}`)});
   </script>
 </body>

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +68,20 @@ func TestColorAndLowerZoomMajorityPreserveTransparency(t *testing.T) {
 	}
 	if got := majority4(clear, clear, clear, clear); got.A != 0 {
 		t.Fatalf("all-transparent block must remain transparent, got %#v", got)
+	}
+}
+
+func TestViewerSwitchesRasterResamplingByZoom(t *testing.T) {
+	html := string(viewerHTML)
+	for _, fragment := range []string{
+		"const pixelPerfectZoom=12.5",
+		"map.getZoom()>=pixelPerfectZoom?'nearest':'linear'",
+		"map.setPaintProperty('geopixels','raster-resampling',resampling)",
+		"map.on('zoom',updateResampling)",
+	} {
+		if !strings.Contains(html, fragment) {
+			t.Fatalf("viewer is missing zoom resampling behavior %q", fragment)
+		}
 	}
 }
 
