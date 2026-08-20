@@ -34,14 +34,15 @@ func colorIntToRGBA(value int32) color.NRGBA {
 
 func majority4(values ...color.NRGBA) color.NRGBA {
 	counts := map[color.NRGBA]int{}
+	for _, value := range values {
+		if value.A != 0 {
+			counts[value]++
+		}
+	}
 	best := color.NRGBA{}
 	bestCount := 0
 	for _, value := range values {
-		if value.A == 0 {
-			continue
-		}
-		counts[value]++
-		if counts[value] > bestCount {
+		if value.A != 0 && counts[value] > bestCount {
 			best, bestCount = value, counts[value]
 		}
 	}

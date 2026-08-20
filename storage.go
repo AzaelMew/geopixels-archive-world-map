@@ -14,6 +14,8 @@ import (
 
 type Archive struct{ DB *sql.DB }
 
+var errInvalidTile = errors.New("invalid tile coordinate")
+
 type IngestResult struct {
 	VersionID    int64
 	Events       int
@@ -281,7 +283,7 @@ func storeTile(tx *sql.Tx, versionID int64, zoom, x, y int, img image.Image) err
 
 func (a *Archive) GetTile(versionID int64, zoom, x, y int) ([]byte, error) {
 	if zoom < 0 || zoom > maxZoom || x < 0 || y < 0 || x >= 1<<zoom || y >= 1<<zoom {
-		return nil, fmt.Errorf("invalid tile %d/%d/%d", zoom, x, y)
+		return nil, fmt.Errorf("%w: %d/%d/%d", errInvalidTile, zoom, x, y)
 	}
 	var data []byte
 	err := a.DB.QueryRow(`SELECT data FROM tiles WHERE z=? AND x=? AND y=? AND version_id<=?

@@ -32,7 +32,7 @@ func NewHandler(archive *Archive) http.Handler {
 		rows, err := archive.DB.Query(`SELECT id,label,timestamp,source,event_count,declared_count,deletion_count
 			FROM versions ORDER BY timestamp,id`)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "database error", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
@@ -40,10 +40,14 @@ func NewHandler(archive *Archive) http.Handler {
 		for rows.Next() {
 			var version Version
 			if err := rows.Scan(&version.ID, &version.Label, &version.Timestamp, &version.Source, &version.EventCount, &version.DeclaredCount, &version.Deletions); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				http.Error(w, "database error", http.StatusInternalServerError)
 				return
 			}
 			versions = append(versions, version)
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(versions)
@@ -68,12 +72,16 @@ func NewHandler(archive *Archive) http.Handler {
 			}
 		}
 		data, err := archive.GetTile(version, coordinates[0], coordinates[1], coordinates[2])
+		if errors.Is(err, errInvalidTile) {
+			http.Error(w, "invalid tile coordinate", http.StatusBadRequest)
+			return
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, "database error", http.StatusInternalServerError)
 			return
 		}
 		etag := fmt.Sprintf(`"%d-%d-%d-%d"`, version, coordinates[0], coordinates[1], coordinates[2])

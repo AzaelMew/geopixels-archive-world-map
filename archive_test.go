@@ -62,6 +62,9 @@ func TestColorAndLowerZoomMajorityPreserveTransparency(t *testing.T) {
 	if got := majority4(clear, red, blue, red); got != red {
 		t.Fatalf("majority non-transparent color = %#v, want red", got)
 	}
+	if got := majority4(red, blue, blue, red); got != red {
+		t.Fatalf("2-2 tie = %#v, want first non-transparent red", got)
+	}
 	if got := majority4(clear, clear, clear, clear); got.A != 0 {
 		t.Fatalf("all-transparent block must remain transparent, got %#v", got)
 	}
@@ -157,6 +160,25 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	handler.ServeHTTP(future, httptest.NewRequest(http.MethodGet, "/tiles/999/13/4096/4096.png", nil))
 	if future.Code != http.StatusNotFound {
 		t.Fatalf("unknown future version returned status %d, want 404", future.Code)
+	}
+
+	invalidTile := httptest.NewRecorder()
+	handler.ServeHTTP(invalidTile, httptest.NewRequest(http.MethodGet, "/tiles/1/14/0/0.png", nil))
+	if invalidTile.Code != http.StatusBadRequest || invalidTile.Body.String() != "invalid tile coordinate\n" {
+		t.Fatalf("invalid tile returned status=%d body=%q", invalidTile.Code, invalidTile.Body.String())
+	}
+
+	broken, err := OpenArchive(filepath.Join(t.TempDir(), "broken.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broken.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	databaseFailure := httptest.NewRecorder()
+	NewHandler(broken).ServeHTTP(databaseFailure, httptest.NewRequest(http.MethodGet, path, nil))
+	if databaseFailure.Code != http.StatusInternalServerError || databaseFailure.Body.String() != "database error\n" {
+		t.Fatalf("database failure leaked as status=%d body=%q", databaseFailure.Code, databaseFailure.Body.String())
 	}
 }
 
