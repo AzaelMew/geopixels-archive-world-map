@@ -21,7 +21,7 @@
     const params=new URLSearchParams(location.search);
     const select=document.querySelector('#version'),status=document.querySelector('#status');
     let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0;
-    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:false,style:{version:8,sources:{osm:{type:'raster',tiles:['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png','https://b.tile.openstreetmap.org/{z}/{x}/{y}.png','https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors'}},layers:[{id:'osm',type:'raster',source:'osm'}]}});
+    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:false,style:'/map-style.json'});
     map.addControl(new maplibregl.NavigationControl());
 
     const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
@@ -49,7 +49,7 @@
     async function refreshTiles(){
       if(!pixelTileLayer||!archiveVersion)return;
       const generation=++refreshGeneration;
-      const z=clamp(Math.floor(map.getZoom()),0,maxDataZoom),n=Math.pow(2,z),bounds=map.getBounds();
+      const z=Math.min(maxDataZoom,Math.ceil(map.getZoom())+1),n=Math.pow(2,z),bounds=map.getBounds();
       const minX=clamp(lngToTileX(bounds.getWest(),z)-1,0,n-1),maxX=clamp(lngToTileX(bounds.getEast(),z)+1,0,n-1);
       const minY=clamp(latToTileY(bounds.getNorth(),z)-1,0,n-1),maxY=clamp(latToTileY(bounds.getSouth(),z)+1,0,n-1);
       const active=new Set(),jobs=[];

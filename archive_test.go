@@ -75,11 +75,13 @@ func TestViewerUsesOfficialPixelTileLayer(t *testing.T) {
 	html := string(viewerHTML)
 	for _, fragment := range []string{
 		"maplibre-gl@5.9.0",
+		"style:'/map-style.json'",
 		"<script src=\"/pixel-tile-layer.js\"></script>",
 		"new PixelTileLayer('pixel-tiles')",
 		"pixelTileLayer.softness=1.0",
 		"pixelTileLayer.setTile(",
 		"imageOrientation:'flipY'",
+		"Math.min(maxDataZoom,Math.ceil(map.getZoom())+1)",
 		"map.on('moveend',refreshTiles)",
 	} {
 		if !strings.Contains(html, fragment) {
@@ -89,8 +91,19 @@ func TestViewerUsesOfficialPixelTileLayer(t *testing.T) {
 	if strings.Contains(html, "raster-resampling") {
 		t.Fatal("viewer still uses MapLibre raster resampling instead of PixelTileLayer")
 	}
+	if strings.Contains(html, "tile.openstreetmap.org") {
+		t.Fatal("viewer still uses the placeholder OSM raster style")
+	}
 	if strings.Contains(html, "||!map.loaded()") {
 		t.Fatal("refreshTiles cannot wait for map.loaded() inside the map load handler")
+	}
+}
+
+func TestRewriteMapStyleUsesLocalProxy(t *testing.T) {
+	input := `{"sprite":"http://localhost:5039/sprites/ofm","glyphs":"http://localhost:5039/fonts/{fontstack}/{range}.pbf"}`
+	want := `{"sprite":"https://archive.example/geopixels-style/sprites/ofm","glyphs":"https://archive.example/geopixels-style/fonts/{fontstack}/{range}.pbf"}`
+	if got := rewriteMapStyle(input, "https://archive.example/geopixels-style/"); got != want {
+		t.Fatalf("rewritten style = %s, want %s", got, want)
 	}
 }
 
@@ -175,6 +188,15 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 		if !strings.Contains(layerScript.Body.String(), fragment) {
 			t.Fatalf("PixelTileLayer script is missing %q", fragment)
 		}
+	}
+
+	mapStyle := httptest.NewRecorder()
+	handler.ServeHTTP(mapStyle, httptest.NewRequest(http.MethodGet, "/map-style.json", nil))
+	if mapStyle.Code != http.StatusOK || mapStyle.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("map style response: status=%d type=%q", mapStyle.Code, mapStyle.Header().Get("Content-Type"))
+	}
+	if strings.Contains(mapStyle.Body.String(), "http://localhost:5039/") || !strings.Contains(mapStyle.Body.String(), "http://example.com/geopixels-style/tiles/") {
+		t.Fatal("map style URLs were not rewritten through the local proxy")
 	}
 
 	tile := httptest.NewRecorder()

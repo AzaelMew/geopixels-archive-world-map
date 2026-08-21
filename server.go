@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -16,6 +18,13 @@ var viewerHTML []byte
 
 //go:embed pixel-tile-layer.js
 var pixelTileLayerJS []byte
+
+//go:embed geopixels-style.json
+var geopixelsStyle []byte
+
+func rewriteMapStyle(style, proxyBase string) string {
+	return strings.ReplaceAll(style, "http://localhost:5039/", proxyBase)
+}
 
 type Version struct {
 	ID            int64  `json:"id"`
@@ -31,6 +40,27 @@ func (v Version) IDString() string { return strconv.FormatInt(v.ID, 10) }
 
 func NewHandler(archive *Archive) http.Handler {
 	mux := http.NewServeMux()
+	styleTarget, _ := url.Parse("https://geopixels.net")
+	styleProxy := httputil.NewSingleHostReverseProxy(styleTarget)
+	direct := styleProxy.Director
+	styleProxy.Director = func(request *http.Request) {
+		direct(request)
+		request.Host = styleTarget.Host
+	}
+	styleProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+		http.Error(w, "upstream style error", http.StatusBadGateway)
+	}
+	mux.Handle("/geopixels-style/", http.StripPrefix("/geopixels-style", styleProxy))
+	mux.HandleFunc("GET /map-style.json", func(w http.ResponseWriter, r *http.Request) {
+		scheme := "http"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		proxyBase := scheme + "://" + r.Host + "/geopixels-style/"
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write([]byte(rewriteMapStyle(string(geopixelsStyle), proxyBase)))
+	})
 	mux.HandleFunc("GET /pixel-tile-layer.js", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
