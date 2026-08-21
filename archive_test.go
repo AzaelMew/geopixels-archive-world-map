@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +68,42 @@ func TestColorAndLowerZoomMajorityPreserveTransparency(t *testing.T) {
 	}
 	if got := majority4(clear, clear, clear, clear); got.A != 0 {
 		t.Fatalf("all-transparent block must remain transparent, got %#v", got)
+	}
+}
+
+func TestViewerUsesOfficialPixelTileLayer(t *testing.T) {
+	html := string(viewerHTML)
+	for _, fragment := range []string{
+		"maplibre-gl@5.9.0",
+		"style:'/map-style.json'",
+		"<script src=\"/pixel-tile-layer.js\"></script>",
+		"new PixelTileLayer('pixel-tiles')",
+		"pixelTileLayer.softness=1.0",
+		"pixelTileLayer.setTile(",
+		"imageOrientation:'flipY'",
+		"Math.min(maxDataZoom,Math.ceil(map.getZoom())+1)",
+		"map.on('moveend',refreshTiles)",
+	} {
+		if !strings.Contains(html, fragment) {
+			t.Fatalf("viewer is missing official GPU tile behavior %q", fragment)
+		}
+	}
+	if strings.Contains(html, "raster-resampling") {
+		t.Fatal("viewer still uses MapLibre raster resampling instead of PixelTileLayer")
+	}
+	if strings.Contains(html, "tile.openstreetmap.org") {
+		t.Fatal("viewer still uses the placeholder OSM raster style")
+	}
+	if strings.Contains(html, "||!map.loaded()") {
+		t.Fatal("refreshTiles cannot wait for map.loaded() inside the map load handler")
+	}
+}
+
+func TestRewriteMapStyleUsesLocalProxy(t *testing.T) {
+	input := `{"sprite":"http://localhost:5039/sprites/ofm","glyphs":"http://localhost:5039/fonts/{fontstack}/{range}.pbf"}`
+	want := `{"sprite":"https://archive.example/geopixels-style/sprites/ofm","glyphs":"https://archive.example/geopixels-style/fonts/{fontstack}/{range}.pbf"}`
+	if got := rewriteMapStyle(input, "https://archive.example/geopixels-style/"); got != want {
+		t.Fatalf("rewritten style = %s, want %s", got, want)
 	}
 }
 
@@ -140,6 +177,26 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	var metadata []Version
 	if err := json.Unmarshal(versions.Body.Bytes(), &metadata); err != nil || len(metadata) != 1 || metadata[0].Label != "2026-01-02" {
 		t.Fatalf("versions JSON = %s err=%v", versions.Body.String(), err)
+	}
+
+	layerScript := httptest.NewRecorder()
+	handler.ServeHTTP(layerScript, httptest.NewRequest(http.MethodGet, "/pixel-tile-layer.js", nil))
+	if layerScript.Code != http.StatusOK || layerScript.Header().Get("Content-Type") != "text/javascript; charset=utf-8" {
+		t.Fatalf("PixelTileLayer response: status=%d type=%q", layerScript.Code, layerScript.Header().Get("Content-Type"))
+	}
+	for _, fragment := range []string{"uniform float u_texelsPerPixel", "gl.LINEAR", "class PixelTileLayer"} {
+		if !strings.Contains(layerScript.Body.String(), fragment) {
+			t.Fatalf("PixelTileLayer script is missing %q", fragment)
+		}
+	}
+
+	mapStyle := httptest.NewRecorder()
+	handler.ServeHTTP(mapStyle, httptest.NewRequest(http.MethodGet, "/map-style.json", nil))
+	if mapStyle.Code != http.StatusOK || mapStyle.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("map style response: status=%d type=%q", mapStyle.Code, mapStyle.Header().Get("Content-Type"))
+	}
+	if strings.Contains(mapStyle.Body.String(), "http://localhost:5039/") || !strings.Contains(mapStyle.Body.String(), "http://example.com/geopixels-style/tiles/") {
+		t.Fatal("map style URLs were not rewritten through the local proxy")
 	}
 
 	tile := httptest.NewRecorder()
