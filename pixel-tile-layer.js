@@ -260,7 +260,7 @@ class PixelTileLayer {
         }
 
         for (const entry of this.tiles.values()) {
-            if (!entry.verts) continue;
+            if (!entry.verts || entry.hidden) continue;
 
             // out = m * translate(ox, oy) * scale(sx, sy), all in f64
             for (let r = 0; r < 4; r++) {

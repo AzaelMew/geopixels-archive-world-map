@@ -21,6 +21,9 @@
     const params=new URLSearchParams(location.search);
     const select=document.querySelector('#version'),status=document.querySelector('#status');
     let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0;
+    const maxCachedTiles=256;
+    const tileUsage=new Map();
+    let usageTick=0;
     const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:true,style:'/map-style.json'});
     map.addControl(new maplibregl.NavigationControl());
 
@@ -77,25 +80,72 @@
       return {key:`${version}/${z}/${x}/${y}@${world}`,bitmap,corners:nativeTileCorners(z,x,y,world)};
     }
 
-    async function refreshTiles(){
-      if(!pixelTileLayer||!archiveVersion)return;
-      const generation=++refreshGeneration,z=dataLevel(),tiles=visibleNativeTiles(map.getBounds(),z);
-      const active=new Set(),jobs=[];
-      for(const {x,y,world} of tiles){
-        const key=`${archiveVersion}/${z}/${x}/${y}@${world}`;
-        active.add(key);
-        if(!pixelTileLayer.hasTile(key))jobs.push(fetchTile(archiveVersion,z,x,y,world,generation).catch(error=>{console.error(error);return null}));
+    function touchLoadedTile(key,needed){
+      const entry=pixelTileLayer.tiles.get(key);
+      if(!entry)return false;
+      // Map iteration is draw order: touching parent levels first keeps detailed tiles on top.
+      pixelTileLayer.tiles.delete(key);pixelTileLayer.tiles.set(key,entry);
+      tileUsage.set(key,++usageTick);needed.add(key);
+      return true;
+    }
+    function showOnlyLevel(level,needed){
+      for(const [key,entry] of pixelTileLayer.tiles)entry.hidden=!needed.has(key)||Number(key.split('/')[1])!==level;
+      if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
+    }
+    function evictTileCache(needed){
+      // ponytail: retain 256 textures (~64 MiB) plus any larger currently visible set.
+      const limit=Math.max(maxCachedTiles,needed.size);
+      if(pixelTileLayer.tiles.size<=limit)return;
+      const candidates=[...pixelTileLayer.tiles.keys()]
+        .filter(key=>!needed.has(key))
+        .sort((a,b)=>(tileUsage.get(a)||0)-(tileUsage.get(b)||0));
+      for(const key of candidates){
+        if(pixelTileLayer.tiles.size<=limit)break;
+        pixelTileLayer.removeTile(key);tileUsage.delete(key);
+      }
+    }
+    function visibleTileKeys(){
+      return new Set([...pixelTileLayer.tiles].filter(([,entry])=>!entry.hidden).map(([key])=>key));
+    }
+    function clearTileCache(){
+      refreshGeneration++;
+      if(pixelTileLayer)pixelTileLayer.clear();
+      tileUsage.clear();usageTick=0;
+    }
+    async function loadVisibleLevel(version,z,generation,needed){
+      const jobs=[];let failed=false;
+      for(const {x,y,world} of visibleNativeTiles(map.getBounds(),z)){
+        const key=`${version}/${z}/${x}/${y}@${world}`;
+        needed.add(key);
+        if(!touchLoadedTile(key,needed))jobs.push(fetchTile(version,z,x,y,world,generation).catch(error=>{console.error(error);failed=true;return null}));
       }
       const loaded=await Promise.all(jobs);
-      if(generation!==refreshGeneration){for(const tile of loaded)if(tile)tile.bitmap.close();return}
-      for(const tile of loaded)if(tile){pixelTileLayer.setTile(tile.key,tile.bitmap,tile.corners);tile.bitmap.close()}
-      // Keep prior tiles visible until replacements finish, then bound GPU memory to the active viewport.
-      for(const key of [...pixelTileLayer.tiles.keys()])if(!active.has(key))pixelTileLayer.removeTile(key);
+      if(generation!==refreshGeneration){for(const tile of loaded)if(tile)tile.bitmap.close();return false}
+      for(const tile of loaded)if(tile){
+        pixelTileLayer.setTile(tile.key,tile.bitmap,tile.corners);tile.bitmap.close();
+        const entry=pixelTileLayer.tiles.get(tile.key);
+        if(entry){entry.hidden=true;touchLoadedTile(tile.key,needed)}
+      }
+      return !failed;
+    }
+
+    async function refreshTiles(){
+      if(!pixelTileLayer||!archiveVersion)return;
+      const generation=++refreshGeneration,z=dataLevel();
+      const levels=[...new Set([Math.max(0,z-2),Math.max(0,z-1),z])];
+      for(const level of levels){
+        const levelNeeded=new Set();
+        if(!await loadVisibleLevel(archiveVersion,level,generation,levelNeeded)){
+          evictTileCache(visibleTileKeys());return;
+        }
+        showOnlyLevel(level,levelNeeded);
+        evictTileCache(levelNeeded);
+      }
     }
 
     function showVersion(id){
-      archiveVersion=String(id);refreshGeneration++;
-      if(pixelTileLayer)pixelTileLayer.clear();
+      archiveVersion=String(id);
+      clearTileCache();
       params.set('version',archiveVersion);history.replaceState(null,'',`${location.pathname}?${params}`);
       refreshTiles();
     }
@@ -106,7 +156,7 @@
 
     map.on('style.load',()=>{
       map.setProjection({type:'mercator'});
-      if(pixelTileLayer&&!map.getLayer(pixelTileLayer.id)){pixelTileLayer.clear();map.addLayer(pixelTileLayer);refreshTiles()}
+      if(pixelTileLayer&&!map.getLayer(pixelTileLayer.id)){clearTileCache();map.addLayer(pixelTileLayer);refreshTiles()}
     });
     map.on('load',async()=>{
       pixelTileLayer=new PixelTileLayer('pixel-tiles');

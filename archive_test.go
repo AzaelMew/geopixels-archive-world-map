@@ -173,6 +173,15 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 		"(gx0-0.5)*gridSize",
 		"imageOrientation:'flipY'",
 		"`/tiles/${version}/${z}/${x}/${y}.png`",
+		"const maxCachedTiles=256",
+		"const tileUsage=new Map()",
+		"async function loadVisibleLevel",
+		"Math.max(0,z-2)",
+		"touchLoadedTile",
+		"evictTileCache",
+		"showOnlyLevel",
+		"let failed=false",
+		"return !failed",
 	} {
 		if !strings.Contains(html, fragment) {
 			t.Errorf("viewer is missing native-grid behavior %q", fragment)
@@ -183,6 +192,9 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 	}
 	if strings.Contains(html, "tile.openstreetmap.org") {
 		t.Fatal("viewer still uses the placeholder OSM raster style")
+	}
+	if strings.Contains(html, "if(!active.has(key))pixelTileLayer.removeTile(key)") {
+		t.Fatal("viewer still evicts every off-screen tile immediately")
 	}
 }
 
@@ -342,6 +354,9 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	}
 	if !strings.Contains(layerScript.Body.String(), "this._quadUploaded = false") {
 		t.Fatal("PixelTileLayer does not reset its shared quad after WebGL removal")
+	}
+	if !strings.Contains(layerScript.Body.String(), "entry.hidden") {
+		t.Fatal("PixelTileLayer cannot retain hidden parent fallback textures")
 	}
 	for _, fragment := range []string{"uniform float u_texelsPerPixel", "gl.LINEAR"} {
 		if !strings.Contains(layerScript.Body.String(), fragment) {
