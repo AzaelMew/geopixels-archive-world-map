@@ -20,7 +20,7 @@
     const gridSize=25,tileSize=256,maxDataZoom=13,earthRadius=6378137,mercatorHalfWorld=Math.PI*earthRadius;
     const params=new URLSearchParams(location.search);
     const select=document.querySelector('#version'),status=document.querySelector('#status');
-    let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0;
+    let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0,refreshController=null;
     const maxCachedTiles=256;
     const tileUsage=new Map();
     let usageTick=0;
@@ -70,27 +70,54 @@
     }
     const dataLevel=()=>clamp(Math.ceil(map.getZoom())+1,0,maxDataZoom);
 
-    async function fetchTile(version,z,x,y,world,generation){
-      const response=await fetch(`/tiles/${version}/${z}/${x}/${y}.png`);
-      if(response.status===404)return null;
-      if(!response.ok)throw new Error(`Tile ${z}/${x}/${y}: ${response.status}`);
-      // PixelTileLayer's top vertices use v=1; flip the top-down PNG exactly once before upload.
-      const bitmap=await createImageBitmap(await response.blob(),{imageOrientation:'flipY'});
-      if(generation!==refreshGeneration){bitmap.close();return null}
-      return {key:`${version}/${z}/${x}/${y}@${world}`,bitmap,corners:nativeTileCorners(z,x,y,world)};
+    async function fetchTileBlob(version,z,x,y,fetches,signal){
+      const url=`/tiles/${version}/${z}/${x}/${y}.png`;
+      if(!fetches.has(url))fetches.set(url,(async()=>{
+        const response=await fetch(url,{signal});
+        if(response.status===404)return null;
+        if(!response.ok)throw new Error(`Tile ${z}/${x}/${y}: ${response.status}`);
+        return response.blob();
+      })());
+      return fetches.get(url);
+    }
+
+    const floorMod=(value,divisor)=>((value%divisor)+divisor)%divisor;
+    async function cropParentTile(blob,x,y,delta){
+      const parent=await createImageBitmap(blob),scale=Math.pow(2,delta),sourceSize=tileSize/scale;
+      const canvas=typeof OffscreenCanvas!=='undefined'?new OffscreenCanvas(tileSize,tileSize):document.createElement('canvas');
+      canvas.width=tileSize;canvas.height=tileSize;
+      const context=canvas.getContext('2d');context.imageSmoothingEnabled=false;
+      // Source PNG is north-up; native Y grows north, while canvas source Y grows down.
+      const sourceX=floorMod(x,scale)*sourceSize,sourceY=(scale-1-floorMod(y,scale))*sourceSize;
+      context.drawImage(parent,sourceX,sourceY,sourceSize,sourceSize,0,0,tileSize,tileSize);parent.close();
+      return createImageBitmap(canvas,{imageOrientation:'flipY'});
+    }
+
+    async function loadFallbackForTile(version,z,x,y,world,generation,fetches,signal){
+      for(let delta=1;delta<=2&&z-delta>=0;delta++){
+        const scale=Math.pow(2,delta),parentZ=z-delta,parentX=Math.floor(x/scale),parentY=Math.floor(y/scale);
+        try{
+          const blob=await fetchTileBlob(version,parentZ,parentX,parentY,fetches,signal);
+          if(generation!==refreshGeneration)return null;
+          if(!blob)continue;
+          const bitmap=await cropParentTile(blob,x,y,delta);
+          if(generation!==refreshGeneration){bitmap.close();return null}
+          return {key:`fallback/${version}/${z}/${x}/${y}@${world}`,bitmap,corners:nativeTileCorners(z,x,y,world)};
+        }catch(error){
+          if(error.name!=='AbortError')console.error(error);
+          if(signal.aborted)return null;
+        }
+      }
+      return null;
     }
 
     function touchLoadedTile(key,needed){
       const entry=pixelTileLayer.tiles.get(key);
       if(!entry)return false;
-      // Map iteration is draw order: touching parent levels first keeps detailed tiles on top.
       pixelTileLayer.tiles.delete(key);pixelTileLayer.tiles.set(key,entry);
+      entry.hidden=false;
       tileUsage.set(key,++usageTick);needed.add(key);
       return true;
-    }
-    function showOnlyLevel(level,needed){
-      for(const [key,entry] of pixelTileLayer.tiles)entry.hidden=!needed.has(key)||Number(key.split('/')[1])!==level;
-      if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
     }
     function evictTileCache(needed){
       // ponytail: retain 256 textures (~64 MiB) plus any larger currently visible set.
@@ -104,43 +131,79 @@
         pixelTileLayer.removeTile(key);tileUsage.delete(key);
       }
     }
-    function visibleTileKeys(){
-      return new Set([...pixelTileLayer.tiles].filter(([,entry])=>!entry.hidden).map(([key])=>key));
-    }
     function clearTileCache(){
       refreshGeneration++;
+      if(refreshController)refreshController.abort();
+      refreshController=null;
       if(pixelTileLayer)pixelTileLayer.clear();
       tileUsage.clear();usageTick=0;
     }
-    async function loadVisibleLevel(version,z,generation,needed){
-      const jobs=[];let failed=false;
-      for(const {x,y,world} of visibleNativeTiles(map.getBounds(),z)){
-        const key=`${version}/${z}/${x}/${y}@${world}`;
-        needed.add(key);
-        if(!touchLoadedTile(key,needed))jobs.push(fetchTile(version,z,x,y,world,generation).catch(error=>{console.error(error);failed=true;return null}));
+
+    async function loadTargetTile(version,z,x,y,world,generation,fetches,visible,signal){
+      const key=`${version}/${z}/${x}/${y}@${world}`,fallbackKey=`fallback/${version}/${z}/${x}/${y}@${world}`;
+      if(touchLoadedTile(key,visible)){
+        if(pixelTileLayer.hasTile(fallbackKey)){pixelTileLayer.removeTile(fallbackKey);tileUsage.delete(fallbackKey)}
+        return;
       }
-      const loaded=await Promise.all(jobs);
-      if(generation!==refreshGeneration){for(const tile of loaded)if(tile)tile.bitmap.close();return false}
-      for(const tile of loaded)if(tile){
-        pixelTileLayer.setTile(tile.key,tile.bitmap,tile.corners);tile.bitmap.close();
-        const entry=pixelTileLayer.tiles.get(tile.key);
-        if(entry){entry.hidden=true;touchLoadedTile(tile.key,needed)}
+      const reusedFallback=touchLoadedTile(fallbackKey,visible);
+      const detailPromise=fetchTileBlob(version,z,x,y,fetches,signal)
+        .then(blob=>({kind:'detail',blob}))
+        .catch(error=>{if(error.name!=='AbortError')console.error(error);return {kind:'detail',error}});
+      const fallbackPromise=(reusedFallback?Promise.resolve(null):loadFallbackForTile(version,z,x,y,world,generation,fetches,signal))
+        .then(tile=>({kind:'fallback',tile}));
+      const removeFallback=()=>{
+        if(pixelTileLayer.hasTile(fallbackKey))pixelTileLayer.removeTile(fallbackKey);
+        tileUsage.delete(fallbackKey);visible.delete(fallbackKey);
+      };
+      const applyFallback=result=>{
+        if(!result||!result.tile)return;
+        if(generation!==refreshGeneration){result.tile.bitmap.close();return}
+        pixelTileLayer.setTile(result.tile.key,result.tile.bitmap,result.tile.corners);result.tile.bitmap.close();
+        if(pixelTileLayer.hasTile(result.tile.key))touchLoadedTile(result.tile.key,visible);
+      };
+      const applyDetail=async result=>{
+        if(generation!==refreshGeneration||!result||result.error)return false;
+        if(result.blob===null){removeFallback();return true}
+        let bitmap;
+        try{bitmap=await createImageBitmap(result.blob,{imageOrientation:'flipY'})}
+        catch(error){if(error.name!=='AbortError')console.error('Failed to decode detail tile',error);return false}
+        if(generation!==refreshGeneration){bitmap.close();return false}
+        pixelTileLayer.setTile(key,bitmap,nativeTileCorners(z,x,y,world));bitmap.close();
+        if(pixelTileLayer.hasTile(key))touchLoadedTile(key,visible);
+        removeFallback();return true;
+      };
+      const first=await Promise.race([detailPromise,fallbackPromise]);
+      if(generation!==refreshGeneration){
+        if(first.kind==='fallback'&&first.tile)first.tile.bitmap.close();
+        else fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()});
+        return;
       }
-      return !failed;
+      if(first.kind==='detail'){
+        if(await applyDetail(first)){
+          fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()});return;
+        }
+        if(reusedFallback)return;
+        applyFallback(await fallbackPromise);return;
+      }
+      applyFallback(first);
+      await applyDetail(await detailPromise);
     }
 
     async function refreshTiles(){
       if(!pixelTileLayer||!archiveVersion)return;
-      const generation=++refreshGeneration,z=dataLevel();
-      const levels=[...new Set([Math.max(0,z-2),Math.max(0,z-1),z])];
-      for(const level of levels){
-        const levelNeeded=new Set();
-        if(!await loadVisibleLevel(archiveVersion,level,generation,levelNeeded)){
-          evictTileCache(visibleTileKeys());return;
-        }
-        showOnlyLevel(level,levelNeeded);
-        evictTileCache(levelNeeded);
+      if(refreshController)refreshController.abort();
+      const controller=new AbortController();refreshController=controller;
+      const generation=++refreshGeneration,z=dataLevel(),visible=new Set(),fetches=new Map();
+      const targets=visibleNativeTiles(map.getBounds(),z);
+      await Promise.all(targets.map(({x,y,world})=>loadTargetTile(archiveVersion,z,x,y,world,generation,fetches,visible,controller.signal)));
+      if(generation!==refreshGeneration)return;
+      for(const [key,entry] of pixelTileLayer.tiles){
+        if(key.startsWith('fallback/')&&!visible.has(key)){pixelTileLayer.removeTile(key);tileUsage.delete(key);continue}
+        entry.hidden=!visible.has(key);
       }
+      if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
+      evictTileCache(visible);
+      if(refreshController===controller)refreshController=null;
     }
 
     function showVersion(id){

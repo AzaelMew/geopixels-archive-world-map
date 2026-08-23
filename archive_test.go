@@ -175,13 +175,18 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 		"`/tiles/${version}/${z}/${x}/${y}.png`",
 		"const maxCachedTiles=256",
 		"const tileUsage=new Map()",
-		"async function loadVisibleLevel",
-		"Math.max(0,z-2)",
 		"touchLoadedTile",
 		"evictTileCache",
-		"showOnlyLevel",
-		"let failed=false",
-		"return !failed",
+		"async function fetchTileBlob",
+		"async function cropParentTile",
+		"async function loadFallbackForTile",
+		"fallback/${version}/${z}/${x}/${y}@${world}",
+		"imageSmoothingEnabled=false",
+		"result.blob===null",
+		"Promise.race",
+		"touchLoadedTile(fallbackKey",
+		"new AbortController()",
+		"Failed to decode detail tile",
 	} {
 		if !strings.Contains(html, fragment) {
 			t.Errorf("viewer is missing native-grid behavior %q", fragment)
@@ -195,6 +200,9 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 	}
 	if strings.Contains(html, "if(!active.has(key))pixelTileLayer.removeTile(key)") {
 		t.Fatal("viewer still evicts every off-screen tile immediately")
+	}
+	if strings.Contains(html, "showOnlyLevel") || strings.Contains(html, "const levels=[") {
+		t.Fatal("viewer still replaces the whole viewport with a low-resolution level")
 	}
 }
 
