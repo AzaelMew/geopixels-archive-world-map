@@ -9,6 +9,7 @@ import (
 	"image/draw"
 	"image/png"
 	"io"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -30,7 +31,11 @@ type IngestResult struct {
 }
 
 func OpenArchive(path string) (*Archive, error) {
-	db, err := sql.Open("sqlite3", path)
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	db, err := sql.Open("sqlite3", path+separator+"_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -110,31 +115,28 @@ func (a *Archive) RequireNativeTileFormat() error {
 }
 
 func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err error) {
+	index := 0
+	return a.IngestEvents(dump.Label, source, dump.DeclaredCount, func() (Event, error) {
+		if index == len(dump.Events) {
+			return Event{}, io.EOF
+		}
+		event := dump.Events[index]
+		index++
+		return event, nil
+	})
+}
+
+func (a *Archive) IngestEvents(label, source string, declaredCount int, next func() (Event, error)) (_ IngestResult, err error) {
 	if err := a.RequireNativeTileFormat(); err != nil {
 		return IngestResult{}, err
 	}
-	if len(dump.Events) == 0 {
+	first, err := next()
+	if errors.Is(err, io.EOF) {
 		return IngestResult{}, errors.New("dump contains no events")
 	}
-	minTimestamp, maxTimestamp := dump.Events[0].LastModified, dump.Events[0].LastModified
-	deletions := 0
-	for _, event := range dump.Events {
-		minTimestamp = min(minTimestamp, event.LastModified)
-		maxTimestamp = max(maxTimestamp, event.LastModified)
-		if event.Color == -1 {
-			deletions++
-		} else if event.Color < 0 || event.Color > 0xffffff {
-			return IngestResult{}, fmt.Errorf("invalid color %d at %d,%d", event.Color, event.GridX, event.GridY)
-		}
-	}
-	var latest sql.NullInt64
-	if err := a.DB.QueryRow("SELECT MAX(timestamp) FROM versions").Scan(&latest); err != nil {
+	if err != nil {
 		return IngestResult{}, err
 	}
-	if latest.Valid && minTimestamp < latest.Int64 {
-		return IngestResult{}, fmt.Errorf("dump starts at %d before latest archived timestamp %d", minTimestamp, latest.Int64)
-	}
-
 	tx, err := a.DB.Begin()
 	if err != nil {
 		return IngestResult{}, err
@@ -144,8 +146,13 @@ func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err err
 			_ = tx.Rollback()
 		}
 	}()
+	// BEGIN IMMEDIATE (configured in OpenArchive) serializes this watermark check across processes.
+	var latest sql.NullInt64
+	if err := tx.QueryRow("SELECT MAX(timestamp) FROM versions").Scan(&latest); err != nil {
+		return IngestResult{}, err
+	}
 	result, err := tx.Exec(`INSERT INTO versions(label,timestamp,source,event_count,declared_count,deletion_count)
-		VALUES(?,?,?,?,?,?)`, dump.Label, maxTimestamp, source, len(dump.Events), dump.DeclaredCount, deletions)
+		VALUES(?,?,?,?,?,?)`, label, first.LastModified, source, 0, 0, 0)
 	if err != nil {
 		return IngestResult{}, err
 	}
@@ -154,37 +161,98 @@ func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err err
 		return IngestResult{}, err
 	}
 	putChange, err := tx.Prepare(`INSERT INTO changes(version_id,grid_x,grid_y,color,modified) VALUES(?,?,?,?,?)
-		ON CONFLICT(version_id,grid_x,grid_y) DO UPDATE SET color=excluded.color, modified=excluded.modified`)
+		ON CONFLICT(version_id,grid_x,grid_y) DO UPDATE SET color=excluded.color, modified=excluded.modified
+		WHERE excluded.modified>=changes.modified`)
 	if err != nil {
 		return IngestResult{}, err
 	}
 	defer putChange.Close()
+	minTimestamp, maxTimestamp := first.LastModified, first.LastModified
+	events, deletions := 0, 0
+	put := func(event Event) error {
+		if event.LastModified < 0 {
+			return fmt.Errorf("invalid lastmodified %d at %d,%d", event.LastModified, event.GridX, event.GridY)
+		}
+		if event.Color != -1 && (event.Color < 0 || event.Color > 0xffffff) {
+			return fmt.Errorf("invalid color %d at %d,%d", event.Color, event.GridX, event.GridY)
+		}
+		minTimestamp = min(minTimestamp, event.LastModified)
+		maxTimestamp = max(maxTimestamp, event.LastModified)
+		events++
+		if event.Color == -1 {
+			deletions++
+		}
+		if _, err = putChange.Exec(versionID, event.GridX, event.GridY, event.Color, event.LastModified); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := put(first); err != nil {
+		return IngestResult{}, err
+	}
+	for {
+		event, readErr := next()
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return IngestResult{}, readErr
+		}
+		if err := put(event); err != nil {
+			return IngestResult{}, err
+		}
+	}
+	if latest.Valid && minTimestamp < latest.Int64 {
+		return IngestResult{}, fmt.Errorf("dump starts at %d before latest archived timestamp %d", minTimestamp, latest.Int64)
+	}
+	if declaredCount < 0 {
+		declaredCount = events
+	}
+	if _, err := tx.Exec(`UPDATE versions SET timestamp=?,event_count=?,declared_count=?,deletion_count=? WHERE id=?`,
+		maxTimestamp, events, declaredCount, deletions, versionID); err != nil {
+		return IngestResult{}, err
+	}
+
 	putState, err := tx.Prepare(`INSERT INTO state(grid_x,grid_y,color,modified) VALUES(?,?,?,?)
-		ON CONFLICT(grid_x,grid_y) DO UPDATE SET color=excluded.color, modified=excluded.modified`)
+		ON CONFLICT(grid_x,grid_y) DO UPDATE SET color=excluded.color, modified=excluded.modified
+		WHERE excluded.modified>=state.modified`)
 	if err != nil {
 		return IngestResult{}, err
 	}
 	defer putState.Close()
-	deleteState, err := tx.Prepare("DELETE FROM state WHERE grid_x=? AND grid_y=?")
+	deleteState, err := tx.Prepare("DELETE FROM state WHERE grid_x=? AND grid_y=? AND modified<=?")
 	if err != nil {
 		return IngestResult{}, err
 	}
 	defer deleteState.Close()
-
+	rows, err := tx.Query("SELECT grid_x,grid_y,color,modified FROM changes WHERE version_id=?", versionID)
+	if err != nil {
+		return IngestResult{}, err
+	}
 	affected := map[tileCoord]struct{}{}
-	for _, event := range dump.Events {
-		if _, err = putChange.Exec(versionID, event.GridX, event.GridY, event.Color, event.LastModified); err != nil {
+	for rows.Next() {
+		var event Event
+		if err := rows.Scan(&event.GridX, &event.GridY, &event.Color, &event.LastModified); err != nil {
+			rows.Close()
 			return IngestResult{}, err
 		}
 		if event.Color == -1 {
-			_, err = deleteState.Exec(event.GridX, event.GridY)
+			_, err = deleteState.Exec(event.GridX, event.GridY, event.LastModified)
 		} else {
 			_, err = putState.Exec(event.GridX, event.GridY, event.Color, event.LastModified)
 		}
 		if err != nil {
+			rows.Close()
 			return IngestResult{}, err
 		}
 		affected[gridCellTile(event.GridX, event.GridY, maxZoom)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return IngestResult{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return IngestResult{}, err
 	}
 
 	stored, err := compileTiles(tx, versionID, affected)
@@ -194,7 +262,7 @@ func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err err
 	if err = tx.Commit(); err != nil {
 		return IngestResult{}, err
 	}
-	return IngestResult{VersionID: versionID, Events: len(dump.Events), Deletions: deletions, ChangedTiles: stored}, nil
+	return IngestResult{VersionID: versionID, Events: events, Deletions: deletions, ChangedTiles: stored}, nil
 }
 
 func compileTiles(tx *sql.Tx, versionID int64, affected map[tileCoord]struct{}) (int, error) {
@@ -265,6 +333,10 @@ func (a *Archive) RebuildTiles(output io.Writer) (RebuildResult, error) {
 		}
 		versions = append(versions, version)
 		previousID = version.ID
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RebuildResult{}, err
 	}
 	if err := rows.Close(); err != nil {
 		return RebuildResult{}, err
@@ -351,6 +423,10 @@ func (a *Archive) rebuildVersionTiles(versionID int64) (_ int, _ int, err error)
 		affected[gridCellTile(event.GridX, event.GridY, maxZoom)] = struct{}{}
 		changes++
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, err
+	}
 	if err := rows.Close(); err != nil {
 		return 0, 0, err
 	}
@@ -380,6 +456,10 @@ func renderBaseTile(tx *sql.Tx, x, y int) (*image.NRGBA, error) {
 		}
 		// One z13 texel is exactly one source cell; grid Y grows north while PNG Y grows down.
 		img.SetNRGBA(gx-gx0, tileSize-1-(gy-gy0), colorIntToRGBA(value))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err

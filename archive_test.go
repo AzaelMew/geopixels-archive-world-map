@@ -8,11 +8,14 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReadDumpReversesPackedWebPColumns(t *testing.T) {
@@ -513,5 +516,155 @@ func TestCLIRebuildTilesFromChangesPreservesHistory(t *testing.T) {
 	}
 	if got := read(v2.VersionID, 0, 0); got != (color.NRGBA{G: 255, A: 255}) {
 		t.Fatalf("rebuilt v2 east pixel = %#v", got)
+	}
+}
+
+func TestConcurrentIngestSerializesVersionTimestamps(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "archive.db")
+	high, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer high.Close()
+	low, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer low.Close()
+
+	highWaiting := make(chan struct{})
+	releaseHigh := make(chan struct{})
+	highCalls := 0
+	highResult := make(chan error, 1)
+	go func() {
+		_, err := high.IngestEvents("high", "fixture", 1, func() (Event, error) {
+			highCalls++
+			if highCalls == 1 {
+				return Event{GridX: 0, GridY: 0, Color: 1, LastModified: 100}, nil
+			}
+			close(highWaiting)
+			<-releaseHigh
+			return Event{}, io.EOF
+		})
+		highResult <- err
+	}()
+	<-highWaiting
+	lowResult := make(chan error, 1)
+	go func() {
+		calls := 0
+		_, err := low.IngestEvents("low", "fixture", 1, func() (Event, error) {
+			calls++
+			if calls == 1 {
+				return Event{GridX: 1, GridY: 0, Color: 2, LastModified: 90}, nil
+			}
+			return Event{}, io.EOF
+		})
+		lowResult <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(releaseHigh)
+	if err := <-highResult; err != nil {
+		t.Fatalf("high ingest: %v", err)
+	}
+	if err := <-lowResult; err == nil || !strings.Contains(err.Error(), "before latest archived timestamp") {
+		t.Fatalf("low ingest error = %v, want chronological rejection", err)
+	}
+}
+
+func TestPostgresCSVReaderUsesNamedColumnsAndIgnoresUserID(t *testing.T) {
+	reader, err := newPostgresCSVEventReader(strings.NewReader("gridx,gridy,color,userid,lastmodified\n-425000,141086,16049373,5155,1775191405\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Event{GridX: -425000, GridY: 141086, Color: 16049373, LastModified: 1775191405}
+	if event != want {
+		t.Fatalf("CSV event = %+v, want %+v", event, want)
+	}
+	if _, err := reader.Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("second CSV read error = %v, want EOF", err)
+	}
+	if _, err := newPostgresCSVEventReader(strings.NewReader("gridx,gridy,color\n1,2,3\n")); err == nil {
+		t.Fatal("CSV reader accepted a header without lastmodified")
+	}
+	if err := run([]string{"ingest-postgres", "-label", "missing-file"}, io.Discard); err == nil || !strings.Contains(err.Error(), "-csv is required") {
+		t.Fatalf("missing completed CSV error = %v", err)
+	}
+}
+
+func TestCLIPostgresCSVIngestRollsBackMalformedStream(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "archive.db")
+	csvPath := filepath.Join(dir, "broken.csv")
+	if err := os.WriteFile(csvPath, []byte("gridx,gridy,color,userid,lastmodified\n1,2,3,4,100\n1,2,not-a-color,4,101\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"ingest-postgres", "-db", dbPath, "-csv", csvPath, "-label", "broken"}, io.Discard); err == nil {
+		t.Fatal("malformed PostgreSQL stream succeeded")
+	}
+	a, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	var versions int
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM versions").Scan(&versions); err != nil || versions != 0 {
+		t.Fatalf("failed stream left %d versions: %v", versions, err)
+	}
+}
+
+func TestCLIPostgresCSVIngestAppliesAndCompilesIncrementalChanges(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "archive.db")
+	firstCSV := filepath.Join(dir, "first.csv")
+	secondCSV := filepath.Join(dir, "second.csv")
+	if err := os.WriteFile(firstCSV, []byte("gridx,gridy,color,userid,lastmodified\n-425000,141086,16049373,5155,1775191405\n-425000,141087,8481136,12611,1774129294\n-424999,141088,1193046,12611,1775191406\n-425000,141086,1,5155,1774000000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondCSV, []byte("gridx,gridy,color,userid,lastmodified\n-425000,141086,66051,5155,1775191406\n-425000,141087,-1,12611,1775191501\n-425000,141087,16711680,12611,1775191500\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := run([]string{"ingest-postgres", "-db", dbPath, "-csv", firstCSV, "-label", "snapshot"}, &output); err != nil {
+		t.Fatalf("first postgres ingest: %v output=%s", err, output.String())
+	}
+	output.Reset()
+	if err := run([]string{"ingest-postgres", "-db", dbPath, "-csv", secondCSV, "-label", "incremental"}, &output); err != nil {
+		t.Fatalf("incremental postgres ingest: %v output=%s", err, output.String())
+	}
+	a, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	var versions int
+	if err := a.DB.QueryRow("SELECT COUNT(*) FROM versions").Scan(&versions); err != nil || versions != 2 {
+		t.Fatalf("versions=%d err=%v", versions, err)
+	}
+	read := func(versionID int64, gx, gy int32) color.NRGBA {
+		tile := gridCellTile(gx, gy, maxZoom)
+		data, err := a.GetTile(versionID, maxZoom, tile.X, tile.Y)
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, err := png.Decode(bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		px := int(gx) - tile.X*tileSize
+		py := tileSize - 1 - (int(gy) - tile.Y*tileSize)
+		return color.NRGBAModel.Convert(img.At(px, py)).(color.NRGBA)
+	}
+	if got := read(1, -425000, 141086); got != colorIntToRGBA(16049373) {
+		t.Fatalf("historical pixel = %#v", got)
+	}
+	if got := read(2, -425000, 141086); got != colorIntToRGBA(66051) {
+		t.Fatalf("updated pixel = %#v", got)
+	}
+	if got := read(2, -425000, 141087); got.A != 0 {
+		t.Fatalf("deleted pixel = %#v, want transparent", got)
 	}
 }

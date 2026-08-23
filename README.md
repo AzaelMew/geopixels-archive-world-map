@@ -44,6 +44,54 @@ Ingest folders in chronological order. `-limit` is only for a disposable tracer 
 ./geopixels-archive ingest -db data/archive.db -dump data/source/dump_2025-09-28
 ```
 
+### Stream rows from PostgreSQL 18
+
+`ingest-postgres` reads a completed PostgreSQL `COPY ... CSV HEADER` file, ignores `userid`, keeps the newest `lastmodified` row per coordinate, applies the resulting changes to `state`, and compiles only affected native tiles and parents. No PostgreSQL driver or database credentials are added to this project. The export is staged first so a failed producer cannot commit a partial archive version.
+
+If `PixelsHistory` already represents the complete state you want and you do not need separate historical dates, compile it as one version:
+
+```sh
+set -euo pipefail
+CSV=$(mktemp)
+trap 'rm -f "$CSV"' EXIT
+LABEL=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+psql "$DATABASE_URL" -X -q --set ON_ERROR_STOP=1 -c '
+COPY (
+  SELECT gridx, gridy, color, userid, lastmodified
+  FROM PixelsHistory
+  ORDER BY lastmodified, userid, gridx, gridy
+) TO STDOUT WITH (FORMAT csv, HEADER true);
+' > "$CSV"
+./geopixels-archive ingest-postgres \
+  -db data/archive.db \
+  -csv "$CSV" \
+  -label "$LABEL"
+```
+
+For the next ingest, export rows modified at or after the newest compiled timestamp:
+
+```sh
+set -euo pipefail
+CSV=$(mktemp)
+trap 'rm -f "$CSV"' EXIT
+LAST=$(sqlite3 data/archive.db 'SELECT COALESCE(MAX(timestamp),0) FROM versions;')
+LABEL=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+psql "$DATABASE_URL" -X -q --set ON_ERROR_STOP=1 -c "
+COPY (
+  SELECT gridx, gridy, color, userid, lastmodified
+  FROM PixelsHistory
+  WHERE lastmodified >= $LAST
+  ORDER BY lastmodified, userid, gridx, gridy
+) TO STDOUT WITH (FORMAT csv, HEADER true);
+" > "$CSV"
+./geopixels-archive ingest-postgres \
+  -db data/archive.db \
+  -csv "$CSV" \
+  -label "$LABEL"
+```
+
+Each successful run is one selectable archive version. The incremental query deliberately includes rows whose timestamp equals the previous maximum so updates sharing that Unix second are not missed. Input order does not decide conflicts: the greatest `lastmodified` wins per coordinate, with later CSV rows breaking exact timestamp ties. Deletion still requires an explicit `color=-1` row; physically removed PostgreSQL rows cannot be inferred. If `versions` and `changes` are already populated in SQLite, skip export entirely and use `rebuild-tiles` below.
+
 SQLite stores:
 
 - `changes`: one final daily change per coordinate, including `color=-1` tombstones;
