@@ -14,7 +14,7 @@ import (
 
 func run(args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: geopixels-archive <ingest|serve> [options]")
+		return errors.New("usage: geopixels-archive <ingest|rebuild-tiles|serve> [options]")
 	}
 	switch args[0] {
 	case "ingest":
@@ -43,6 +43,23 @@ func run(args []string, output io.Writer) error {
 			return err
 		}
 		return json.NewEncoder(output).Encode(result)
+	case "rebuild-tiles":
+		flags := flag.NewFlagSet("rebuild-tiles", flag.ContinueOnError)
+		flags.SetOutput(output)
+		dbPath := flags.String("db", "data/archive.db", "SQLite archive path")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		archive, err := OpenArchive(*dbPath)
+		if err != nil {
+			return err
+		}
+		defer archive.Close()
+		result, err := archive.RebuildTiles(output)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(output).Encode(result)
 	case "serve":
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 		flags.SetOutput(output)
@@ -56,6 +73,9 @@ func run(args []string, output io.Writer) error {
 			return err
 		}
 		defer archive.Close()
+		if err := archive.RequireNativeTileFormat(); err != nil {
+			return err
+		}
 		fmt.Fprintf(output, "GeoPixels archive: http://%s\n", *listen)
 		server := &http.Server{Addr: *listen, Handler: NewHandler(archive), ReadHeaderTimeout: 5 * time.Second}
 		return server.ListenAndServe()

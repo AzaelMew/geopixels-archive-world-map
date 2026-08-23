@@ -26,6 +26,25 @@ func rewriteMapStyle(style, proxyBase string) string {
 	return strings.ReplaceAll(style, "http://localhost:5039/", proxyBase)
 }
 
+func styleAssetMethodAllowed(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+func styleAssetPathAllowed(path string) bool {
+	for _, prefix := range []string{"/tiles/", "/natural_earth/", "/sprites/", "/fonts/"} {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func scrubStyleProxyHeaders(header http.Header) {
+	header.Del("Authorization")
+	header.Del("Proxy-Authorization")
+	header.Del("Cookie")
+}
+
 type Version struct {
 	ID            int64  `json:"id"`
 	Label         string `json:"label"`
@@ -46,11 +65,25 @@ func NewHandler(archive *Archive) http.Handler {
 	styleProxy.Director = func(request *http.Request) {
 		direct(request)
 		request.Host = styleTarget.Host
+		scrubStyleProxyHeaders(request.Header)
 	}
 	styleProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "upstream style error", http.StatusBadGateway)
 	}
-	mux.Handle("/geopixels-style/", http.StripPrefix("/geopixels-style", styleProxy))
+	styleAssets := http.StripPrefix("/geopixels-style", styleProxy)
+	mux.HandleFunc("/geopixels-style/", func(w http.ResponseWriter, r *http.Request) {
+		if !styleAssetMethodAllowed(r.Method) {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !styleAssetPathAllowed(strings.TrimPrefix(r.URL.Path, "/geopixels-style")) {
+			http.NotFound(w, r)
+			return
+		}
+		scrubStyleProxyHeaders(r.Header)
+		styleAssets.ServeHTTP(w, r)
+	})
 	mux.HandleFunc("GET /map-style.json", func(w http.ResponseWriter, r *http.Request) {
 		scheme := "http"
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {

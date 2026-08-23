@@ -8,13 +8,19 @@ import (
 	"image"
 	"image/draw"
 	"image/png"
+	"io"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 type Archive struct{ DB *sql.DB }
 
-var errInvalidTile = errors.New("invalid tile coordinate")
+const nativeTileFormatVersion = 1
+
+var (
+	errInvalidTile            = errors.New("invalid tile coordinate")
+	errIncompatibleTileFormat = errors.New("archive tiles use an incompatible format; run rebuild-tiles")
+)
 
 type IngestResult struct {
 	VersionID    int64
@@ -30,6 +36,11 @@ func OpenArchive(path string) (*Archive, error) {
 	}
 	// ponytail: serialize SQLite access; raise this only if local read throughput matters.
 	db.SetMaxOpenConns(1)
+	var existingSchema int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('versions','tiles')").Scan(&existingSchema); err != nil {
+		db.Close()
+		return nil, err
+	}
 	for _, statement := range []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
@@ -73,6 +84,12 @@ func OpenArchive(path string) (*Archive, error) {
 			return nil, err
 		}
 	}
+	if existingSchema == 0 {
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d", nativeTileFormatVersion)); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	return &Archive{DB: db}, nil
 }
 
@@ -81,7 +98,21 @@ func (a *Archive) Close() error {
 	return a.DB.Close()
 }
 
+func (a *Archive) RequireNativeTileFormat() error {
+	var version int
+	if err := a.DB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version != nativeTileFormatVersion {
+		return fmt.Errorf("%w (found %d, need %d)", errIncompatibleTileFormat, version, nativeTileFormatVersion)
+	}
+	return nil
+}
+
 func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err error) {
+	if err := a.RequireNativeTileFormat(); err != nil {
+		return IngestResult{}, err
+	}
 	if len(dump.Events) == 0 {
 		return IngestResult{}, errors.New("dump contains no events")
 	}
@@ -153,39 +184,12 @@ func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err err
 		if err != nil {
 			return IngestResult{}, err
 		}
-		for _, tile := range gridCellTiles(event.GridX, event.GridY, maxZoom) {
-			affected[tile] = struct{}{}
-		}
+		affected[gridCellTile(event.GridX, event.GridY, maxZoom)] = struct{}{}
 	}
 
-	stored := 0
-	for tile := range affected {
-		img, err := renderBaseTile(tx, tile.X, tile.Y)
-		if err != nil {
-			return IngestResult{}, err
-		}
-		if err = storeTile(tx, versionID, maxZoom, tile.X, tile.Y, img); err != nil {
-			return IngestResult{}, err
-		}
-		stored++
-	}
-	children := affected
-	for zoom := maxZoom - 1; zoom >= 0; zoom-- {
-		parents := map[tileCoord]struct{}{}
-		for child := range children {
-			parents[tileCoord{child.X / 2, child.Y / 2}] = struct{}{}
-		}
-		for parent := range parents {
-			img, err := mergeParentTile(tx, versionID, zoom, parent.X, parent.Y)
-			if err != nil {
-				return IngestResult{}, err
-			}
-			if err = storeTile(tx, versionID, zoom, parent.X, parent.Y, img); err != nil {
-				return IngestResult{}, err
-			}
-			stored++
-		}
-		children = parents
+	stored, err := compileTiles(tx, versionID, affected)
+	if err != nil {
+		return IngestResult{}, err
 	}
 	if err = tx.Commit(); err != nil {
 		return IngestResult{}, err
@@ -193,46 +197,205 @@ func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err err
 	return IngestResult{VersionID: versionID, Events: len(dump.Events), Deletions: deletions, ChangedTiles: stored}, nil
 }
 
+func compileTiles(tx *sql.Tx, versionID int64, affected map[tileCoord]struct{}) (int, error) {
+	stored := 0
+	for tile := range affected {
+		img, err := renderBaseTile(tx, tile.X, tile.Y)
+		if err != nil {
+			return 0, err
+		}
+		if err := storeTile(tx, versionID, maxZoom, tile.X, tile.Y, img); err != nil {
+			return 0, err
+		}
+		stored++
+	}
+	children := affected
+	for zoom := maxZoom - 1; zoom >= 0; zoom-- {
+		parents := map[tileCoord]struct{}{}
+		for child := range children {
+			// Native tile coordinates are signed; Go's truncation toward zero is wrong west/south of the origin.
+			parents[tileCoord{floorDiv(child.X, 2), floorDiv(child.Y, 2)}] = struct{}{}
+		}
+		for parent := range parents {
+			img, err := mergeParentTile(tx, versionID, zoom, parent.X, parent.Y)
+			if err != nil {
+				return 0, err
+			}
+			if err := storeTile(tx, versionID, zoom, parent.X, parent.Y, img); err != nil {
+				return 0, err
+			}
+			stored++
+		}
+		children = parents
+	}
+	return stored, nil
+}
+
+type RebuildResult struct {
+	Versions int `json:"versions"`
+	Changes  int `json:"changes"`
+	Tiles    int `json:"tiles"`
+}
+
+type rebuildVersion struct {
+	ID    int64
+	Label string
+}
+
+func (a *Archive) RebuildTiles(output io.Writer) (RebuildResult, error) {
+	if output == nil {
+		output = io.Discard
+	}
+	rows, err := a.DB.Query("SELECT id,label FROM versions ORDER BY timestamp,id")
+	if err != nil {
+		return RebuildResult{}, err
+	}
+	versions := []rebuildVersion{}
+	var previousID int64
+	for rows.Next() {
+		var version rebuildVersion
+		if err := rows.Scan(&version.ID, &version.Label); err != nil {
+			rows.Close()
+			return RebuildResult{}, err
+		}
+		// Tile inheritance uses version_id<=selected, so chronological IDs must be monotonic.
+		if len(versions) > 0 && version.ID <= previousID {
+			rows.Close()
+			return RebuildResult{}, fmt.Errorf("version IDs are not chronological at %s (%d after %d)", version.Label, version.ID, previousID)
+		}
+		versions = append(versions, version)
+		previousID = version.ID
+	}
+	if err := rows.Close(); err != nil {
+		return RebuildResult{}, err
+	}
+
+	reset, err := a.DB.Begin()
+	if err != nil {
+		return RebuildResult{}, err
+	}
+	if _, err := reset.Exec("PRAGMA user_version=0"); err != nil {
+		reset.Rollback()
+		return RebuildResult{}, err
+	}
+	if _, err := reset.Exec("DELETE FROM tiles"); err != nil {
+		reset.Rollback()
+		return RebuildResult{}, err
+	}
+	if _, err := reset.Exec("DELETE FROM state"); err != nil {
+		reset.Rollback()
+		return RebuildResult{}, err
+	}
+	if err := reset.Commit(); err != nil {
+		return RebuildResult{}, err
+	}
+
+	result := RebuildResult{Versions: len(versions)}
+	for index, version := range versions {
+		changes, tiles, err := a.rebuildVersionTiles(version.ID)
+		if err != nil {
+			return RebuildResult{}, fmt.Errorf("rebuild %s: %w", version.Label, err)
+		}
+		result.Changes += changes
+		result.Tiles += tiles
+		fmt.Fprintf(output, "[%d/%d] %s: %d changes, %d tiles\n", index+1, len(versions), version.Label, changes, tiles)
+	}
+	if _, err := a.DB.Exec(fmt.Sprintf("PRAGMA user_version=%d", nativeTileFormatVersion)); err != nil {
+		return RebuildResult{}, err
+	}
+	return result, nil
+}
+
+func (a *Archive) rebuildVersionTiles(versionID int64) (_ int, _ int, err error) {
+	tx, err := a.DB.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	putState, err := tx.Prepare(`INSERT INTO state(grid_x,grid_y,color,modified) VALUES(?,?,?,?)
+		ON CONFLICT(grid_x,grid_y) DO UPDATE SET color=excluded.color, modified=excluded.modified`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer putState.Close()
+	deleteState, err := tx.Prepare("DELETE FROM state WHERE grid_x=? AND grid_y=?")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer deleteState.Close()
+	rows, err := tx.Query("SELECT grid_x,grid_y,color,modified FROM changes WHERE version_id=? ORDER BY grid_x,grid_y", versionID)
+	if err != nil {
+		return 0, 0, err
+	}
+	affected := map[tileCoord]struct{}{}
+	changes := 0
+	for rows.Next() {
+		var event Event
+		if err := rows.Scan(&event.GridX, &event.GridY, &event.Color, &event.LastModified); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		if event.Color == -1 {
+			_, err = deleteState.Exec(event.GridX, event.GridY)
+		} else {
+			_, err = putState.Exec(event.GridX, event.GridY, event.Color, event.LastModified)
+		}
+		if err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		affected[gridCellTile(event.GridX, event.GridY, maxZoom)] = struct{}{}
+		changes++
+	}
+	if err := rows.Close(); err != nil {
+		return 0, 0, err
+	}
+	tiles, err := compileTiles(tx, versionID, affected)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return changes, tiles, nil
+}
+
 func renderBaseTile(tx *sql.Tx, x, y int) (*image.NRGBA, error) {
-	gx1, gy1 := tilePixelToGrid(maxZoom, x, y, 0, 0)
-	gx2, gy2 := tilePixelToGrid(maxZoom, x, y, tileSize-1, tileSize-1)
-	minX, maxX := min(gx1, gx2)-1, max(gx1, gx2)+1
-	minY, maxY := min(gy1, gy2)-1, max(gy1, gy2)+1
-	rows, err := tx.Query("SELECT grid_x,grid_y,color FROM state WHERE grid_x BETWEEN ? AND ? AND grid_y BETWEEN ? AND ?", minX, maxX, minY, maxY)
+	gx0, gy0 := x*tileSize, y*tileSize
+	rows, err := tx.Query("SELECT grid_x,grid_y,color FROM state WHERE grid_x BETWEEN ? AND ? AND grid_y BETWEEN ? AND ?", gx0, gx0+tileSize-1, gy0, gy0+tileSize-1)
 	if err != nil {
 		return nil, err
 	}
-	colors := map[uint64]int32{}
+	img := image.NewNRGBA(image.Rect(0, 0, tileSize, tileSize))
 	for rows.Next() {
-		var gx, gy int32
+		var gx, gy int
 		var value int32
 		if err := rows.Scan(&gx, &gy, &value); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		colors[gridKey(gx, gy)] = value
+		// One z13 texel is exactly one source cell; grid Y grows north while PNG Y grows down.
+		img.SetNRGBA(gx-gx0, tileSize-1-(gy-gy0), colorIntToRGBA(value))
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	img := image.NewNRGBA(image.Rect(0, 0, tileSize, tileSize))
-	for py := range tileSize {
-		for px := range tileSize {
-			gx, gy := tilePixelToGrid(maxZoom, x, y, px, py)
-			if value, ok := colors[gridKey(gx, gy)]; ok {
-				img.SetNRGBA(px, py, colorIntToRGBA(value))
-			}
-		}
-	}
 	return img, nil
 }
 
-func gridKey(x, y int32) uint64 { return uint64(uint32(x))<<32 | uint64(uint32(y)) }
-
 func mergeParentTile(tx *sql.Tx, versionID int64, zoom, x, y int) (*image.NRGBA, error) {
-	children := make([]*image.NRGBA, 4)
-	for i := range 4 {
-		child, err := getTileImage(tx, versionID, zoom+1, x*2+i%2, y*2+i/2)
+	// PNG Y grows downward, but native tile Y grows northward.
+	childCoords := [4]tileCoord{
+		{X: x * 2, Y: y*2 + 1}, {X: x*2 + 1, Y: y*2 + 1},
+		{X: x * 2, Y: y * 2}, {X: x*2 + 1, Y: y * 2},
+	}
+	children := make([]*image.NRGBA, len(childCoords))
+	for i, coord := range childCoords {
+		child, err := getTileImage(tx, versionID, zoom+1, coord.X, coord.Y)
 		if err != nil {
 			return nil, err
 		}
@@ -282,7 +445,10 @@ func storeTile(tx *sql.Tx, versionID int64, zoom, x, y int, img image.Image) err
 }
 
 func (a *Archive) GetTile(versionID int64, zoom, x, y int) ([]byte, error) {
-	if zoom < 0 || zoom > maxZoom || x < 0 || y < 0 || x >= 1<<zoom || y >= 1<<zoom {
+	if err := a.RequireNativeTileFormat(); err != nil {
+		return nil, err
+	}
+	if zoom < 0 || zoom > maxZoom {
 		return nil, fmt.Errorf("%w: %d/%d/%d", errInvalidTile, zoom, x, y)
 	}
 	var data []byte

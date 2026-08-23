@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,9 +20,9 @@ const (
 	maxZoom  = 13
 )
 
-var mercatorHalfWorld = math.Pi * 6378137.0
-
 type tileCoord struct{ X, Y int }
+
+type projectedBounds struct{ West, East, South, North float64 }
 
 func colorIntToRGBA(value int32) color.NRGBA {
 	if value == -1 {
@@ -49,37 +48,33 @@ func majority4(values ...color.NRGBA) color.NRGBA {
 	return best
 }
 
-func gridToTile(gridX, gridY int32, zoom int) (int, int) {
-	return mercatorToTile(float64(gridX)*gridSize, float64(gridY)*gridSize, zoom)
-}
-
-func mercatorToTile(mx, my float64, zoom int) (int, int) {
-	n := 1 << zoom
-	x := int(math.Floor((mx + mercatorHalfWorld) / (2 * mercatorHalfWorld) * float64(n)))
-	y := int(math.Floor((mercatorHalfWorld - my) / (2 * mercatorHalfWorld) * float64(n)))
-	return min(max(x, 0), n-1), min(max(y, 0), n-1)
-}
-
-func tilePixelToGrid(zoom, x, y, pixelX, pixelY int) (int32, int32) {
-	pixels := float64(tileSize * (int(1) << zoom))
-	mx := (float64(x*tileSize+pixelX)+0.5)/pixels*(2*mercatorHalfWorld) - mercatorHalfWorld
-	my := mercatorHalfWorld - (float64(y*tileSize+pixelY)+0.5)/pixels*(2*mercatorHalfWorld)
-	return int32(math.Round(mx / gridSize)), int32(math.Round(my / gridSize))
-}
-
-func gridCellTiles(gridX, gridY int32, zoom int) []tileCoord {
-	cx, cy := float64(gridX)*gridSize, float64(gridY)*gridSize
-	west, east := cx-gridSize/2, math.Nextafter(cx+gridSize/2, math.Inf(-1))
-	south, north := cy-gridSize/2, math.Nextafter(cy+gridSize/2, math.Inf(-1))
-	minX, minY := mercatorToTile(west, north, zoom)
-	maxX, maxY := mercatorToTile(east, south, zoom)
-	result := make([]tileCoord, 0, 4)
-	for x := minX; x <= maxX; x++ {
-		for y := minY; y <= maxY; y++ {
-			result = append(result, tileCoord{x, y})
-		}
+func floorDiv(value, divisor int) int {
+	quotient, remainder := value/divisor, value%divisor
+	if remainder < 0 {
+		quotient--
 	}
-	return result
+	return quotient
+}
+
+func cellsPerTexel(zoom int) int { return 1 << (maxZoom - zoom) }
+
+func cellsPerTile(zoom int) int { return tileSize * cellsPerTexel(zoom) }
+
+func gridCellTile(gridX, gridY int32, zoom int) tileCoord {
+	span := cellsPerTile(zoom)
+	return tileCoord{floorDiv(int(gridX), span), floorDiv(int(gridY), span)}
+}
+
+func nativeTileBounds(zoom, x, y int) projectedBounds {
+	span := cellsPerTile(zoom)
+	gx0, gy0 := x*span, y*span
+	// Grid coordinates name cell centres, so tile edges sit half a cell outside.
+	return projectedBounds{
+		West:  (float64(gx0) - 0.5) * gridSize,
+		East:  (float64(gx0+span) - 0.5) * gridSize,
+		South: (float64(gy0) - 0.5) * gridSize,
+		North: (float64(gy0+span) - 0.5) * gridSize,
+	}
 }
 
 type Event struct {

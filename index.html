@@ -17,50 +17,79 @@
   <script src="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
   <script src="/pixel-tile-layer.js"></script>
   <script>
-    const maxDataZoom=13;
+    const gridSize=25,tileSize=256,maxDataZoom=13,earthRadius=6378137,mercatorHalfWorld=Math.PI*earthRadius;
     const params=new URLSearchParams(location.search);
     const select=document.querySelector('#version'),status=document.querySelector('#status');
     let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0;
-    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:false,style:'/map-style.json'});
+    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:true,style:'/map-style.json'});
     map.addControl(new maplibregl.NavigationControl());
 
     const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
-    function lngToTileX(lng,z){return Math.floor((lng+180)/360*Math.pow(2,z))}
-    function latToTileY(lat,z){
-      const rad=clamp(lat,-85.05112878,85.05112878)*Math.PI/180;
-      return Math.floor((1-Math.log(Math.tan(rad)+1/Math.cos(rad))/Math.PI)/2*Math.pow(2,z));
+    const cellsPerTile=z=>tileSize*Math.pow(2,maxDataZoom-z);
+    const lngToMercatorX=lng=>clamp(lng/180*mercatorHalfWorld,-mercatorHalfWorld,mercatorHalfWorld);
+    const latToMercatorY=lat=>{
+      const radians=clamp(lat,-85.05112878,85.05112878)*Math.PI/180;
+      return earthRadius*Math.log(Math.tan(Math.PI/4+radians/2));
+    };
+    function projectedToLngLat(mx,my){
+      return [mx/earthRadius*180/Math.PI,(2*Math.atan(Math.exp(my/earthRadius))-Math.PI/2)*180/Math.PI];
     }
-    function tileLng(x,z){return x/Math.pow(2,z)*360-180}
-    function tileLat(y,z){const n=Math.PI-2*Math.PI*y/Math.pow(2,z);return 180/Math.PI*Math.atan(Math.sinh(n))}
-    function tileCorners(x,y,z){
-      const west=tileLng(x,z),east=tileLng(x+1,z),north=tileLat(y,z),south=tileLat(y+1,z);
-      return [[west,south],[east,south],[east,north],[west,north]];
+    function nativeTileRange(bounds,z){
+      const span=cellsPerTile(z);
+      const west=lngToMercatorX(bounds.getWest()),east=lngToMercatorX(bounds.getEast());
+      const south=latToMercatorY(bounds.getSouth()),north=latToMercatorY(bounds.getNorth());
+      const tileFor=(mx,my)=>[Math.floor((mx/gridSize+0.5)/span),Math.floor((my/gridSize+0.5)/span)];
+      const [minX,minY]=tileFor(Math.min(west,east),south),[maxX,maxY]=tileFor(Math.max(west,east),north);
+      return {minX:minX-1,maxX:maxX+1,minY:minY-1,maxY:maxY+1};
     }
+    function visibleNativeTiles(bounds,z){
+      const tiles=[],west=bounds.getWest(),east=bounds.getEast()<west?bounds.getEast()+360:bounds.getEast();
+      const firstWorld=Math.floor((bounds.getWest()+180)/360),lastWorld=Math.floor((east+180)/360);
+      for(let world=firstWorld;world<=lastWorld;world++){
+        const offset=world*360,worldWest=-180+offset,worldEast=180+offset;
+        const localBounds={
+          getWest:()=>Math.max(west,worldWest)-offset,
+          getEast:()=>Math.min(east,worldEast)-offset,
+          getSouth:()=>bounds.getSouth(),getNorth:()=>bounds.getNorth()
+        };
+        const range=nativeTileRange(localBounds,z);
+        for(let x=range.minX;x<=range.maxX;x++)for(let y=range.minY;y<=range.maxY;y++)tiles.push({x,y,world});
+      }
+      return tiles;
+    }
+    function nativeTileCorners(z,x,y,world=0){
+      const span=cellsPerTile(z),gx0=x*span,gy0=y*span;
+      // Grid coordinates are cell centres, so native tile boundaries are half a cell outside.
+      const west=(gx0-0.5)*gridSize,east=(gx0+span-0.5)*gridSize;
+      const south=(gy0-0.5)*gridSize,north=(gy0+span-0.5)*gridSize;
+      return [projectedToLngLat(west,south),projectedToLngLat(east,south),projectedToLngLat(east,north),projectedToLngLat(west,north)]
+        .map(([lng,lat])=>[lng+world*360,lat]);
+    }
+    const dataLevel=()=>clamp(Math.ceil(map.getZoom())+1,0,maxDataZoom);
 
-    async function fetchTile(version,z,x,y,generation){
+    async function fetchTile(version,z,x,y,world,generation){
       const response=await fetch(`/tiles/${version}/${z}/${x}/${y}.png`);
       if(response.status===404)return null;
       if(!response.ok)throw new Error(`Tile ${z}/${x}/${y}: ${response.status}`);
+      // PixelTileLayer's top vertices use v=1; flip the top-down PNG exactly once before upload.
       const bitmap=await createImageBitmap(await response.blob(),{imageOrientation:'flipY'});
       if(generation!==refreshGeneration){bitmap.close();return null}
-      return {key:`${version}/${z}/${x}/${y}`,bitmap,corners:tileCorners(x,y,z)};
+      return {key:`${version}/${z}/${x}/${y}@${world}`,bitmap,corners:nativeTileCorners(z,x,y,world)};
     }
 
     async function refreshTiles(){
       if(!pixelTileLayer||!archiveVersion)return;
-      const generation=++refreshGeneration;
-      const z=Math.min(maxDataZoom,Math.ceil(map.getZoom())+1),n=Math.pow(2,z),bounds=map.getBounds();
-      const minX=clamp(lngToTileX(bounds.getWest(),z)-1,0,n-1),maxX=clamp(lngToTileX(bounds.getEast(),z)+1,0,n-1);
-      const minY=clamp(latToTileY(bounds.getNorth(),z)-1,0,n-1),maxY=clamp(latToTileY(bounds.getSouth(),z)+1,0,n-1);
+      const generation=++refreshGeneration,z=dataLevel(),tiles=visibleNativeTiles(map.getBounds(),z);
       const active=new Set(),jobs=[];
-      for(let x=minX;x<=maxX;x++)for(let y=minY;y<=maxY;y++){
-        const key=`${archiveVersion}/${z}/${x}/${y}`;
+      for(const {x,y,world} of tiles){
+        const key=`${archiveVersion}/${z}/${x}/${y}@${world}`;
         active.add(key);
-        if(!pixelTileLayer.hasTile(key))jobs.push(fetchTile(archiveVersion,z,x,y,generation).catch(error=>{console.error(error);return null}));
+        if(!pixelTileLayer.hasTile(key))jobs.push(fetchTile(archiveVersion,z,x,y,world,generation).catch(error=>{console.error(error);return null}));
       }
       const loaded=await Promise.all(jobs);
       if(generation!==refreshGeneration){for(const tile of loaded)if(tile)tile.bitmap.close();return}
       for(const tile of loaded)if(tile){pixelTileLayer.setTile(tile.key,tile.bitmap,tile.corners);tile.bitmap.close()}
+      // Keep prior tiles visible until replacements finish, then bound GPU memory to the active viewport.
       for(const key of [...pixelTileLayer.tiles.keys()])if(!active.has(key))pixelTileLayer.removeTile(key);
     }
 
@@ -71,7 +100,7 @@
       refreshTiles();
     }
     function updateUrl(){
-      const c=map.getCenter();params.set('lng',c.lng.toFixed(6));params.set('lat',c.lat.toFixed(6));params.set('zoom',map.getZoom().toFixed(2));
+      const center=map.getCenter();params.set('lng',center.lng.toFixed(6));params.set('lat',center.lat.toFixed(6));params.set('zoom',map.getZoom().toFixed(2));
       history.replaceState(null,'',`${location.pathname}?${params}`);
     }
 
@@ -86,7 +115,7 @@
       try{
         const response=await fetch('/api/versions'),versions=await response.json();
         if(!versions.length)throw new Error('No versions ingested');
-        for(const v of versions){const option=document.createElement('option');option.value=v.id;option.textContent=`${v.label} (${v.eventCount.toLocaleString()} events)`;select.append(option)}
+        for(const version of versions){const option=document.createElement('option');option.value=version.id;option.textContent=`${version.label} (${version.eventCount.toLocaleString()} events)`;select.append(option)}
         select.value=params.get('version')||versions.at(-1).id;showVersion(select.value);select.onchange=()=>showVersion(select.value);status.textContent='';
       }catch(error){status.textContent=error.message}
     });

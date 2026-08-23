@@ -115,8 +115,11 @@ class PixelTileLayer {
         this.tiles.clear();
         if (this.buffer) gl.deleteBuffer(this.buffer);
         if (this.program) gl.deleteProgram(this.program);
+        this.buffer = null;
         this.program = null;
         this.gl = null;
+        this.map = null;
+        this._quadUploaded = false;
     }
 
     // ---------- tile management ----------

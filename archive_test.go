@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -30,23 +33,185 @@ func TestReadDumpReversesPackedWebPColumns(t *testing.T) {
 	}
 }
 
-func TestCoordinateConversionUsesEPSG3857CentersAndXYZOrientation(t *testing.T) {
-	x, y := gridToTile(0, 0, maxZoom)
-	if x != 4096 || y != 4096 {
-		t.Fatalf("origin mapped to %d/%d, want 4096/4096", x, y)
+func TestNativeTileMappingUsesFloorDivision(t *testing.T) {
+	cases := map[int]int{-257: -2, -256: -1, -255: -1, -1: -1, 0: 0, 1: 0, 255: 0, 256: 1, 257: 1}
+	for grid, want := range cases {
+		if got := floorDiv(grid, tileSize); got != want {
+			t.Errorf("floorDiv(%d, %d) = %d, want %d", grid, tileSize, got, want)
+		}
+		if got := gridCellTile(int32(grid), 0, maxZoom); got != (tileCoord{X: want, Y: 0}) {
+			t.Errorf("grid cell %d mapped to %+v, want x=%d y=0", grid, got, want)
+		}
 	}
-	gx, gy := tilePixelToGrid(maxZoom, 4095, 4095, 0, 0)
-	if gx != -195 || gy != 195 {
-		t.Fatalf("north-west pixel mapped to grid %d,%d, want -195,195", gx, gy)
+}
+
+func TestNativeTileBoundsMeetExactlyAtHalfCellBoundaries(t *testing.T) {
+	for zoom, want := range map[int]int{maxZoom: 1, maxZoom - 1: 2, maxZoom - 2: 4} {
+		if got := cellsPerTexel(zoom); got != want {
+			t.Errorf("level %d cells per texel = %d, want %d", zoom, got, want)
+		}
 	}
-	if _, y = gridToTile(0, 801500, maxZoom); y != 0 {
-		t.Fatalf("north Web Mercator edge mapped to y=%d, want 0", y)
+	left := nativeTileBounds(maxZoom, -1, 0)
+	right := nativeTileBounds(maxZoom, 0, 0)
+	if left.East != right.West {
+		t.Fatalf("adjacent tile boundary differs: left east %.17g right west %.17g", left.East, right.West)
 	}
-	if x, _ = gridToTile(801500, 0, maxZoom); x != (1<<maxZoom)-1 {
-		t.Fatalf("east Web Mercator edge mapped to x=%d", x)
+	if right.West != -gridSize/2 || right.East != (tileSize-0.5)*gridSize {
+		t.Fatalf("tile 0 bounds = %+v", right)
 	}
-	if got := gridCellTiles(0, 0, maxZoom); len(got) != 4 {
-		t.Fatalf("cell crossing the XYZ origin touches %d tiles, want 4: %v", len(got), got)
+	south := nativeTileBounds(maxZoom, 0, 0)
+	north := nativeTileBounds(maxZoom, 0, 1)
+	if south.North != north.South {
+		t.Fatalf("north/south tile boundary differs: south north %.17g north south %.17g", south.North, north.South)
+	}
+}
+
+func TestFullResolutionTilePreservesNativeShapeOneCellPerTexel(t *testing.T) {
+	a, err := OpenArchive(filepath.Join(t.TempDir(), "archive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	shape := []tileCoord{{1, 1}, {2, 1}, {2, 2}, {3, 2}, {3, 3}}
+	events := make([]Event, len(shape))
+	for i, cell := range shape {
+		events[i] = Event{GridX: int32(cell.X), GridY: int32(cell.Y), Color: 0xff0000, LastModified: int64(i + 1)}
+	}
+	version, err := a.IngestDump(&Dump{Label: "shape", DeclaredCount: len(events), Events: events}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := a.GetTile(version.VersionID, maxZoom, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[image.Point]bool{}
+	for _, cell := range shape {
+		want[image.Pt(cell.X, tileSize-1-cell.Y)] = true
+	}
+	opaque := 0
+	for y := range tileSize {
+		for x := range tileSize {
+			_, _, _, alpha := decoded.At(x, y).RGBA()
+			if alpha != 0 {
+				opaque++
+				if !want[image.Pt(x, y)] {
+					t.Fatalf("unexpected opaque texel at %d,%d", x, y)
+				}
+			}
+		}
+	}
+	if opaque != len(shape) {
+		t.Fatalf("opaque texels = %d, want exactly %d native cells", opaque, len(shape))
+	}
+}
+
+func TestParentMergePlacesNorthAndSouthChildrenCorrectly(t *testing.T) {
+	a, err := OpenArchive(filepath.Join(t.TempDir(), "archive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	tx, err := a.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO versions(id,label,timestamp,source,event_count,declared_count,deletion_count) VALUES(1,'v1',1,'fixture',1,1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	red := color.NRGBA{R: 255, A: 255}
+	green := color.NRGBA{G: 255, A: 255}
+	blue := color.NRGBA{B: 255, A: 255}
+	yellow := color.NRGBA{R: 255, G: 255, A: 255}
+	children := map[tileCoord]color.NRGBA{
+		{X: 0, Y: 1}: red, {X: 1, Y: 1}: green,
+		{X: 0, Y: 0}: blue, {X: 1, Y: 0}: yellow,
+	}
+	for child, value := range children {
+		img := image.NewNRGBA(image.Rect(0, 0, tileSize, tileSize))
+		draw.Draw(img, img.Bounds(), image.NewUniform(value), image.Point{}, draw.Src)
+		if err := storeTile(tx, 1, maxZoom, child.X, child.Y, img); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parent, err := mergeParentTile(tx, 1, maxZoom-1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for point, want := range map[image.Point]color.NRGBA{
+		image.Pt(0, 0): red, image.Pt(tileSize-1, 0): green,
+		image.Pt(0, tileSize-1): blue, image.Pt(tileSize-1, tileSize-1): yellow,
+	} {
+		if got := parent.NRGBAAt(point.X, point.Y); got != want {
+			t.Errorf("parent pixel %v = %#v, want %#v", point, got, want)
+		}
+	}
+}
+
+func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
+	html := string(viewerHTML)
+	for _, fragment := range []string{
+		"style:'/map-style.json'",
+		"renderWorldCopies:true",
+		"<script src=\"/pixel-tile-layer.js\"></script>",
+		"new PixelTileLayer('pixel-tiles')",
+		"function nativeTileRange(bounds,z)",
+		"function visibleNativeTiles(bounds,z)",
+		"Math.floor((bounds.getWest()+180)/360)",
+		"world*360",
+		"mx/gridSize+0.5",
+		"my/gridSize+0.5",
+		"function nativeTileCorners(z,x,y,world=0)",
+		"(gx0-0.5)*gridSize",
+		"imageOrientation:'flipY'",
+		"`/tiles/${version}/${z}/${x}/${y}.png`",
+	} {
+		if !strings.Contains(html, fragment) {
+			t.Errorf("viewer is missing native-grid behavior %q", fragment)
+		}
+	}
+	if strings.Contains(html, "type:'raster',tiles:[`${location.origin}/tiles/") || strings.Contains(html, "function tileCorners(x,y,z)") {
+		t.Fatal("viewer still treats archive tiles as standard XYZ raster tiles")
+	}
+	if strings.Contains(html, "tile.openstreetmap.org") {
+		t.Fatal("viewer still uses the placeholder OSM raster style")
+	}
+}
+
+func TestRewriteMapStyleUsesLocalProxy(t *testing.T) {
+	input := `{"sprite":"http://localhost:5039/sprites/ofm","glyphs":"http://localhost:5039/fonts/{fontstack}/{range}.pbf"}`
+	want := `{"sprite":"https://archive.example/geopixels-style/sprites/ofm","glyphs":"https://archive.example/geopixels-style/fonts/{fontstack}/{range}.pbf"}`
+	if got := rewriteMapStyle(input, "https://archive.example/geopixels-style/"); got != want {
+		t.Fatalf("rewritten style = %s, want %s", got, want)
+	}
+}
+
+func TestStyleProxyOnlyAllowsAssetReadsAndDropsCredentials(t *testing.T) {
+	if !styleAssetMethodAllowed(http.MethodGet) || !styleAssetMethodAllowed(http.MethodHead) || styleAssetMethodAllowed(http.MethodPost) {
+		t.Fatal("style proxy must allow only GET and HEAD")
+	}
+	for _, path := range []string{"/tiles/0/0/0.pbf", "/natural_earth/ne2sr/0/0/0.png", "/sprites/ofm.json", "/fonts/Noto/0-255.pbf"} {
+		if !styleAssetPathAllowed(path) {
+			t.Errorf("style proxy rejected asset path %q", path)
+		}
+	}
+	if styleAssetPathAllowed("/api/account") {
+		t.Fatal("style proxy allows non-style upstream paths")
+	}
+	request := httptest.NewRequest(http.MethodGet, "/geopixels-style/tiles/0/0/0.pbf", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	request.Header.Set("Proxy-Authorization", "Basic secret")
+	request.Header.Set("Cookie", "session=secret")
+	scrubStyleProxyHeaders(request.Header)
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie"} {
+		if request.Header.Get(name) != "" {
+			t.Fatalf("style proxy retained sensitive %s header", name)
+		}
 	}
 }
 
@@ -71,42 +236,6 @@ func TestColorAndLowerZoomMajorityPreserveTransparency(t *testing.T) {
 	}
 }
 
-func TestViewerUsesOfficialPixelTileLayer(t *testing.T) {
-	html := string(viewerHTML)
-	for _, fragment := range []string{
-		"maplibre-gl@5.9.0",
-		"style:'/map-style.json'",
-		"<script src=\"/pixel-tile-layer.js\"></script>",
-		"new PixelTileLayer('pixel-tiles')",
-		"pixelTileLayer.softness=1.0",
-		"pixelTileLayer.setTile(",
-		"imageOrientation:'flipY'",
-		"Math.min(maxDataZoom,Math.ceil(map.getZoom())+1)",
-		"map.on('moveend',refreshTiles)",
-	} {
-		if !strings.Contains(html, fragment) {
-			t.Fatalf("viewer is missing official GPU tile behavior %q", fragment)
-		}
-	}
-	if strings.Contains(html, "raster-resampling") {
-		t.Fatal("viewer still uses MapLibre raster resampling instead of PixelTileLayer")
-	}
-	if strings.Contains(html, "tile.openstreetmap.org") {
-		t.Fatal("viewer still uses the placeholder OSM raster style")
-	}
-	if strings.Contains(html, "||!map.loaded()") {
-		t.Fatal("refreshTiles cannot wait for map.loaded() inside the map load handler")
-	}
-}
-
-func TestRewriteMapStyleUsesLocalProxy(t *testing.T) {
-	input := `{"sprite":"http://localhost:5039/sprites/ofm","glyphs":"http://localhost:5039/fonts/{fontstack}/{range}.pbf"}`
-	want := `{"sprite":"https://archive.example/geopixels-style/sprites/ofm","glyphs":"https://archive.example/geopixels-style/fonts/{fontstack}/{range}.pbf"}`
-	if got := rewriteMapStyle(input, "https://archive.example/geopixels-style/"); got != want {
-		t.Fatalf("rewritten style = %s, want %s", got, want)
-	}
-}
-
 func TestIngestKeepsExplicitTombstonesAndHistoricalTiles(t *testing.T) {
 	a, err := OpenArchive(filepath.Join(t.TempDir(), "archive.db"))
 	if err != nil {
@@ -127,7 +256,7 @@ func TestIngestKeepsExplicitTombstonesAndHistoricalTiles(t *testing.T) {
 	}
 
 	readPixel := func(versionID int64) color.NRGBA {
-		data, err := a.GetTile(versionID, maxZoom, 4096, 4096)
+		data, err := a.GetTile(versionID, maxZoom, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -135,7 +264,7 @@ func TestIngestKeepsExplicitTombstonesAndHistoricalTiles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return color.NRGBAModel.Convert(img.At(0, 0)).(color.NRGBA)
+		return color.NRGBAModel.Convert(img.At(0, tileSize-1)).(color.NRGBA)
 	}
 	if got := readPixel(v1.VersionID); got != (color.NRGBA{R: 255, A: 255}) {
 		t.Fatalf("v1 source pixel = %#v, want red", got)
@@ -155,19 +284,80 @@ func TestIngestKeepsExplicitTombstonesAndHistoricalTiles(t *testing.T) {
 	}
 }
 
+func TestParentTileInheritsUnchangedSignedChild(t *testing.T) {
+	a, err := OpenArchive(filepath.Join(t.TempDir(), "archive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.IngestDump(&Dump{Label: "v1", DeclaredCount: 1, Events: []Event{
+		{GridX: -512, GridY: 0, Color: 0xff0000, LastModified: 10},
+	}}, "fixture-v1"); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := a.IngestDump(&Dump{Label: "v2", DeclaredCount: 1, Events: []Event{
+		{GridX: -1, GridY: 0, Color: 0x0000ff, LastModified: 20},
+	}}, "fixture-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := a.GetTile(v2.VersionID, maxZoom-1, -1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := color.NRGBAModel.Convert(img.At(0, tileSize-1)).(color.NRGBA); got != (color.NRGBA{R: 255, A: 255}) {
+		t.Fatalf("inherited western child = %#v, want red", got)
+	}
+	if got := color.NRGBAModel.Convert(img.At(tileSize-1, tileSize-1)).(color.NRGBA); got != (color.NRGBA{B: 255, A: 255}) {
+		t.Fatalf("current eastern child = %#v, want blue", got)
+	}
+}
+
 func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	a, err := OpenArchive(filepath.Join(t.TempDir(), "archive.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	version, err := a.IngestDump(&Dump{Label: "2026-01-02", DeclaredCount: 1, Events: []Event{
+	version, err := a.IngestDump(&Dump{Label: "2026-01-02", DeclaredCount: 2, Events: []Event{
 		{GridX: 0, GridY: 0, Color: 0x123456, LastModified: 123},
+		{GridX: -1, GridY: -1, Color: 0x654321, LastModified: 124},
 	}}, "fixture")
 	if err != nil {
 		t.Fatal(err)
 	}
 	handler := NewHandler(a)
+
+	layerScript := httptest.NewRecorder()
+	handler.ServeHTTP(layerScript, httptest.NewRequest(http.MethodGet, "/pixel-tile-layer.js", nil))
+	if layerScript.Code != http.StatusOK || layerScript.Header().Get("Content-Type") != "text/javascript; charset=utf-8" || !strings.Contains(layerScript.Body.String(), "class PixelTileLayer") {
+		t.Fatalf("PixelTileLayer response: status=%d type=%q", layerScript.Code, layerScript.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(layerScript.Body.String(), "this._quadUploaded = false") {
+		t.Fatal("PixelTileLayer does not reset its shared quad after WebGL removal")
+	}
+	for _, fragment := range []string{"uniform float u_texelsPerPixel", "gl.LINEAR"} {
+		if !strings.Contains(layerScript.Body.String(), fragment) {
+			t.Fatalf("PixelTileLayer script is missing %q", fragment)
+		}
+	}
+	mapStyle := httptest.NewRecorder()
+	handler.ServeHTTP(mapStyle, httptest.NewRequest(http.MethodGet, "/map-style.json", nil))
+	if mapStyle.Code != http.StatusOK || mapStyle.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("map style response: status=%d type=%q", mapStyle.Code, mapStyle.Header().Get("Content-Type"))
+	}
+	if strings.Contains(mapStyle.Body.String(), "http://localhost:5039/") || !strings.Contains(mapStyle.Body.String(), "http://example.com/geopixels-style/tiles/") {
+		t.Fatal("map style URLs were not rewritten through the local proxy")
+	}
+	blockedStyle := httptest.NewRecorder()
+	handler.ServeHTTP(blockedStyle, httptest.NewRequest(http.MethodPost, "/geopixels-style/tiles/0/0/0.pbf", nil))
+	if blockedStyle.Code != http.StatusMethodNotAllowed || blockedStyle.Header().Get("Allow") != "GET, HEAD" {
+		t.Fatalf("style proxy POST: status=%d allow=%q", blockedStyle.Code, blockedStyle.Header().Get("Allow"))
+	}
 
 	versions := httptest.NewRecorder()
 	handler.ServeHTTP(versions, httptest.NewRequest(http.MethodGet, "/api/versions", nil))
@@ -179,28 +369,8 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 		t.Fatalf("versions JSON = %s err=%v", versions.Body.String(), err)
 	}
 
-	layerScript := httptest.NewRecorder()
-	handler.ServeHTTP(layerScript, httptest.NewRequest(http.MethodGet, "/pixel-tile-layer.js", nil))
-	if layerScript.Code != http.StatusOK || layerScript.Header().Get("Content-Type") != "text/javascript; charset=utf-8" {
-		t.Fatalf("PixelTileLayer response: status=%d type=%q", layerScript.Code, layerScript.Header().Get("Content-Type"))
-	}
-	for _, fragment := range []string{"uniform float u_texelsPerPixel", "gl.LINEAR", "class PixelTileLayer"} {
-		if !strings.Contains(layerScript.Body.String(), fragment) {
-			t.Fatalf("PixelTileLayer script is missing %q", fragment)
-		}
-	}
-
-	mapStyle := httptest.NewRecorder()
-	handler.ServeHTTP(mapStyle, httptest.NewRequest(http.MethodGet, "/map-style.json", nil))
-	if mapStyle.Code != http.StatusOK || mapStyle.Header().Get("Content-Type") != "application/json" {
-		t.Fatalf("map style response: status=%d type=%q", mapStyle.Code, mapStyle.Header().Get("Content-Type"))
-	}
-	if strings.Contains(mapStyle.Body.String(), "http://localhost:5039/") || !strings.Contains(mapStyle.Body.String(), "http://example.com/geopixels-style/tiles/") {
-		t.Fatal("map style URLs were not rewritten through the local proxy")
-	}
-
 	tile := httptest.NewRecorder()
-	path := "/tiles/" + metadata[0].IDString() + "/13/4096/4096.png"
+	path := "/tiles/" + metadata[0].IDString() + "/13/0/0.png"
 	handler.ServeHTTP(tile, httptest.NewRequest(http.MethodGet, path, nil))
 	if tile.Code != http.StatusOK || tile.Header().Get("Content-Type") != "image/png" {
 		t.Fatalf("tile response: status=%d type=%q body=%s", tile.Code, tile.Header().Get("Content-Type"), tile.Body.String())
@@ -212,9 +382,14 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	if version.VersionID != metadata[0].ID {
 		t.Fatalf("version ID mismatch: ingest=%d API=%d", version.VersionID, metadata[0].ID)
 	}
+	signed := httptest.NewRecorder()
+	handler.ServeHTTP(signed, httptest.NewRequest(http.MethodGet, "/tiles/"+metadata[0].IDString()+"/13/-1/-1.png", nil))
+	if signed.Code != http.StatusOK || signed.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("signed tile response: status=%d type=%q body=%s", signed.Code, signed.Header().Get("Content-Type"), signed.Body.String())
+	}
 
 	future := httptest.NewRecorder()
-	handler.ServeHTTP(future, httptest.NewRequest(http.MethodGet, "/tiles/999/13/4096/4096.png", nil))
+	handler.ServeHTTP(future, httptest.NewRequest(http.MethodGet, "/tiles/999/13/0/0.png", nil))
 	if future.Code != http.StatusNotFound {
 		t.Fatalf("unknown future version returned status %d, want 404", future.Code)
 	}
@@ -253,5 +428,90 @@ func TestCLIIngestsLimitedFixture(t *testing.T) {
 	var events int
 	if err := a.DB.QueryRow("SELECT event_count FROM versions").Scan(&events); err != nil || events != 5 {
 		t.Fatalf("CLI event_count=%d err=%v output=%s", events, err, output.String())
+	}
+}
+
+func TestUnmarkedArchiveRefusesNativeTilesAndIngest(t *testing.T) {
+	a, err := OpenArchive(filepath.Join(t.TempDir(), "archive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.DB.Exec("PRAGMA user_version=0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RequireNativeTileFormat(); !errors.Is(err, errIncompatibleTileFormat) {
+		t.Fatalf("format check error = %v, want incompatible format", err)
+	}
+	if _, err := a.GetTile(1, maxZoom, 0, 0); !errors.Is(err, errIncompatibleTileFormat) {
+		t.Fatalf("GetTile error = %v, want incompatible format", err)
+	}
+	_, err = a.IngestDump(&Dump{Label: "blocked", DeclaredCount: 1, Events: []Event{{GridX: 0, GridY: 0, Color: 1, LastModified: 1}}}, "fixture")
+	if !errors.Is(err, errIncompatibleTileFormat) {
+		t.Fatalf("IngestDump error = %v, want incompatible format", err)
+	}
+}
+
+func TestCLIRebuildTilesFromChangesPreservesHistory(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "archive.db")
+	a, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, err := a.IngestDump(&Dump{Label: "v1", DeclaredCount: 2, Events: []Event{
+		{GridX: -1, GridY: 0, Color: 0xff0000, LastModified: 10},
+		{GridX: 0, GridY: 0, Color: 0x0000ff, LastModified: 11},
+	}}, "fixture-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := a.IngestDump(&Dump{Label: "v2", DeclaredCount: 2, Events: []Event{
+		{GridX: -1, GridY: 0, Color: -1, LastModified: 20},
+		{GridX: 0, GridY: 0, Color: 0x00ff00, LastModified: 21},
+	}}, "fixture-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DB.Exec("DELETE FROM state; DELETE FROM tiles; PRAGMA user_version=0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := run([]string{"rebuild-tiles", "-db", dbPath}, &output); err != nil {
+		t.Fatalf("rebuild-tiles failed: %v output=%s", err, output.String())
+	}
+	a, err = OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := a.RequireNativeTileFormat(); err != nil {
+		t.Fatal(err)
+	}
+	read := func(versionID int64, tileX, pixelX int) color.NRGBA {
+		data, err := a.GetTile(versionID, maxZoom, tileX, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, err := png.Decode(bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return color.NRGBAModel.Convert(img.At(pixelX, tileSize-1)).(color.NRGBA)
+	}
+	if got := read(v1.VersionID, -1, tileSize-1); got != (color.NRGBA{R: 255, A: 255}) {
+		t.Fatalf("rebuilt v1 west pixel = %#v", got)
+	}
+	if got := read(v1.VersionID, 0, 0); got != (color.NRGBA{B: 255, A: 255}) {
+		t.Fatalf("rebuilt v1 east pixel = %#v", got)
+	}
+	if got := read(v2.VersionID, -1, tileSize-1); got.A != 0 {
+		t.Fatalf("rebuilt v2 tombstone = %#v, want transparent", got)
+	}
+	if got := read(v2.VersionID, 0, 0); got != (color.NRGBA{G: 255, A: 255}) {
+		t.Fatalf("rebuilt v2 east pixel = %#v", got)
 	}
 }
