@@ -9,6 +9,8 @@
     html,body,#map{height:100%;margin:0} body{font:14px system-ui,sans-serif}
     #controls{position:absolute;z-index:2;top:10px;left:10px;display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:6px;background:#fffffff0;box-shadow:0 1px 5px #0005}
     select{font:inherit;max-width:220px} #status{color:#555;font-variant-numeric:tabular-nums}
+    #credit{display:flex;align-items:center;height:23px;padding:0 8px;border-radius:12px;background:#000c;color:#e1e3e9;box-sizing:border-box}
+    .context-link{color:#111;font-weight:600;text-decoration:none;white-space:nowrap}
   </style>
 </head>
 <body>
@@ -28,8 +30,10 @@
     const tileUsage=new Map();
     const missingTiles=new Set();
     let usageTick=0,moveRefreshTimer=0;
-    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:true,style:'/map-style.json'});
+    const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:true,dragRotate:false,style:'/map-style.json'});
     map.addControl(new maplibregl.NavigationControl());
+    const credit=document.createElement('div');credit.id='credit';credit.className='maplibregl-ctrl';credit.textContent='By Azael';
+    map.addControl({onAdd:()=>credit,onRemove:()=>credit.remove()},'bottom-left');
 
     const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
     const cellsPerTile=z=>tileSize*Math.pow(2,maxDataZoom-z);
@@ -38,6 +42,12 @@
       const radians=clamp(lat,-85.05112878,85.05112878)*Math.PI/180;
       return earthRadius*Math.log(Math.tan(Math.PI/4+radians/2));
     };
+    const contextPopup=new maplibregl.Popup({closeButton:false});
+    map.on('contextmenu',e=>{
+      e.originalEvent.preventDefault();
+      const point=e.lngLat.wrap(),x=Math.round(lngToMercatorX(point.lng)/gridSize),y=Math.round(latToMercatorY(point.lat)/gridSize);
+      contextPopup.setLngLat(e.lngLat).setHTML(`<a class="context-link" href="https://geopixels.net/?coords=${x},${y}" target="_blank" rel="noopener">Open on GeoPixels</a>`).addTo(map);
+    });
     function projectedToLngLat(mx,my){
       return [mx/earthRadius*180/Math.PI,(2*Math.atan(Math.exp(my/earthRadius))-Math.PI/2)*180/Math.PI];
     }
