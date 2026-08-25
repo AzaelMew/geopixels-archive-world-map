@@ -22,6 +22,9 @@ var pixelTileLayerJS []byte
 //go:embed geopixels-style.json
 var geopixelsStyle []byte
 
+//go:embed favicon.ico
+var faviconICO []byte
+
 func rewriteMapStyle(style, proxyBase string) string {
 	return strings.ReplaceAll(style, "http://localhost:5039/", proxyBase)
 }
@@ -99,6 +102,11 @@ func NewHandler(archive *Archive) http.Handler {
 		w.Header().Set("Cache-Control", "no-cache")
 		_, _ = w.Write(pixelTileLayerJS)
 	})
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/x-icon")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		_, _ = w.Write(faviconICO)
+	})
 	mux.HandleFunc("GET /api/versions", func(w http.ResponseWriter, _ *http.Request) {
 		rows, err := archive.DB.Query(`SELECT id,label,timestamp,source,event_count,declared_count,deletion_count
 			FROM versions ORDER BY timestamp,id`)
@@ -148,6 +156,17 @@ func NewHandler(archive *Archive) http.Handler {
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
+			if r.URL.Query().Get("optional") == "1" {
+				var versionExists bool
+				if queryErr := archive.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM versions WHERE id=?)", version).Scan(&versionExists); queryErr != nil {
+					http.Error(w, "database error", http.StatusInternalServerError)
+					return
+				}
+				if versionExists {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			}
 			http.NotFound(w, r)
 			return
 		}

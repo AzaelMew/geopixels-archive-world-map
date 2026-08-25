@@ -159,6 +159,7 @@ func TestParentMergePlacesNorthAndSouthChildrenCorrectly(t *testing.T) {
 func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 	html := string(viewerHTML)
 	for _, fragment := range []string{
+		"<link rel=\"icon\" href=\"/favicon.ico\">",
 		"style:'/map-style.json'",
 		"renderWorldCopies:true",
 		"<script src=\"/pixel-tile-layer.js\"></script>",
@@ -172,7 +173,8 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 		"function nativeTileCorners(z,x,y,world=0)",
 		"(gx0-0.5)*gridSize",
 		"imageOrientation:'flipY'",
-		"`/tiles/${version}/${z}/${x}/${y}.png`",
+		"`/tiles/${version}/${z}/${x}/${y}.png?optional=1`",
+		"response.status===204",
 		"const maxCachedTiles=256",
 		"const tileUsage=new Map()",
 		"touchLoadedTile",
@@ -369,6 +371,15 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewHandler(a)
+	favicon := httptest.NewRecorder()
+	handler.ServeHTTP(favicon, httptest.NewRequest(http.MethodGet, "/favicon.ico", nil))
+	wantFavicon, err := os.ReadFile("favicon.ico")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if favicon.Code != http.StatusOK || favicon.Header().Get("Content-Type") != "image/x-icon" || !bytes.Equal(favicon.Body.Bytes(), wantFavicon) {
+		t.Fatalf("favicon response: status=%d type=%q bytes=%d", favicon.Code, favicon.Header().Get("Content-Type"), favicon.Body.Len())
+	}
 
 	layerScript := httptest.NewRecorder()
 	handler.ServeHTTP(layerScript, httptest.NewRequest(http.MethodGet, "/pixel-tile-layer.js", nil))
@@ -429,10 +440,27 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 		t.Fatalf("signed tile response: status=%d type=%q body=%s", signed.Code, signed.Header().Get("Content-Type"), signed.Body.String())
 	}
 
+	missingPath := "/tiles/" + metadata[0].IDString() + "/13/1/1.png"
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, missingPath, nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing tile returned status %d, want 404", missing.Code)
+	}
+	optionalMissing := httptest.NewRecorder()
+	handler.ServeHTTP(optionalMissing, httptest.NewRequest(http.MethodGet, missingPath+"?optional=1", nil))
+	if optionalMissing.Code != http.StatusNoContent || optionalMissing.Body.Len() != 0 {
+		t.Fatalf("optional missing tile returned status=%d body=%q, want empty 204", optionalMissing.Code, optionalMissing.Body.String())
+	}
+
 	future := httptest.NewRecorder()
 	handler.ServeHTTP(future, httptest.NewRequest(http.MethodGet, "/tiles/999/13/0/0.png", nil))
 	if future.Code != http.StatusNotFound {
 		t.Fatalf("unknown future version returned status %d, want 404", future.Code)
+	}
+	futureOptional := httptest.NewRecorder()
+	handler.ServeHTTP(futureOptional, httptest.NewRequest(http.MethodGet, "/tiles/999/13/0/0.png?optional=1", nil))
+	if futureOptional.Code != http.StatusNotFound {
+		t.Fatalf("unknown future version with optional lookup returned status %d, want 404", futureOptional.Code)
 	}
 
 	invalidTile := httptest.NewRecorder()

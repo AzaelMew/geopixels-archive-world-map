@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>GeoPixels archive</title>
+  <link rel="icon" href="/favicon.ico">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.css">
   <style>
     html,body,#map{height:100%;margin:0} body{font:14px system-ui,sans-serif}
@@ -103,11 +104,11 @@
     }
 
     async function fetchTileBlob(version,z,x,y,fetches,signal){
-      const url=`/tiles/${version}/${z}/${x}/${y}.png`;
+      const url=`/tiles/${version}/${z}/${x}/${y}.png?optional=1`;
       if(missingTiles.has(url))return null;
       if(!fetches.has(url))fetches.set(url,(async()=>{
         const response=await fetch(url,{signal});
-        if(response.status===404){
+        if(response.status===204||response.status===404){
           missingTiles.add(url);
           if(missingTiles.size>5000)missingTiles.delete(missingTiles.values().next().value);
           return null;
