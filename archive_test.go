@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +105,101 @@ func TestArchiveConnectionPoolsSeparateServingReadsFromWrites(t *testing.T) {
 	if _, err := reader.DB.Exec(`INSERT INTO versions(label,timestamp,source,event_count,declared_count,deletion_count)
 		VALUES('should-fail',0,'test',0,0,0)`); err == nil {
 		t.Fatal("serving archive allowed a write")
+	}
+}
+
+func TestOpenArchiveForServingValidatesNativeTileFormat(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "archive.db")
+	writer, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.DB.Exec("PRAGMA user_version=0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenArchiveForServing(dbPath)
+	if reader != nil {
+		reader.Close()
+	}
+	if !errors.Is(err, errIncompatibleTileFormat) {
+		t.Fatalf("serving open error = %v, want incompatible format", err)
+	}
+}
+
+func TestServingTileReadsReuseStartupFormatValidation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "archive.db")
+	writer, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := writer.IngestDump(&Dump{Label: "v1", DeclaredCount: 1, Events: []Event{{GridX: 0, GridY: 0, Color: 1, LastModified: 1}}}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenArchiveForServing(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	mutator, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mutator.Close()
+	if _, err := mutator.Exec("PRAGMA user_version=0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.GetTile(version.VersionID, maxZoom, 0, 0); err != nil {
+		t.Fatalf("validated serving tile read repeated the format check: %v", err)
+	}
+}
+
+func TestServingHandlerUsesStartupVersionSnapshotForMissingTiles(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "archive.db")
+	writer, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := writer.IngestDump(&Dump{Label: "v1", DeclaredCount: 1, Events: []Event{{GridX: 0, GridY: 0, Color: 1, LastModified: 1}}}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenArchiveForServing(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	handler := NewHandler(reader)
+
+	knownMissing := httptest.NewRecorder()
+	handler.ServeHTTP(knownMissing, httptest.NewRequest(http.MethodGet, "/tiles/"+strconv.FormatInt(version.VersionID, 10)+"/13/1/1.png?optional=1", nil))
+	if knownMissing.Code != http.StatusNoContent || knownMissing.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("known missing response: status=%d cache-control=%q", knownMissing.Code, knownMissing.Header().Get("Cache-Control"))
+	}
+
+	mutator, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mutator.Close()
+	if _, err := mutator.Exec(`INSERT INTO versions(id,label,timestamp,source,event_count,declared_count,deletion_count)
+		VALUES(999,'late',999,'fixture',0,0,0)`); err != nil {
+		t.Fatal(err)
+	}
+	unknown := httptest.NewRecorder()
+	handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/tiles/999/13/1/1.png?optional=1", nil))
+	if unknown.Code != http.StatusNotFound || unknown.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("version added after startup returned status=%d cache-control=%q, want no-store 404", unknown.Code, unknown.Header().Get("Cache-Control"))
 	}
 }
 
@@ -504,6 +600,17 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	if tile.Code != http.StatusOK || tile.Header().Get("Content-Type") != "image/png" {
 		t.Fatalf("tile response: status=%d type=%q body=%s", tile.Code, tile.Header().Get("Content-Type"), tile.Body.String())
 	}
+	const immutableCache = "public, max-age=31536000, immutable"
+	if tile.Header().Get("Cache-Control") != immutableCache || tile.Header().Get("ETag") == "" {
+		t.Fatalf("tile cache headers: cache-control=%q etag=%q", tile.Header().Get("Cache-Control"), tile.Header().Get("ETag"))
+	}
+	notModified := httptest.NewRecorder()
+	notModifiedRequest := httptest.NewRequest(http.MethodGet, path, nil)
+	notModifiedRequest.Header.Set("If-None-Match", tile.Header().Get("ETag"))
+	handler.ServeHTTP(notModified, notModifiedRequest)
+	if notModified.Code != http.StatusNotModified || notModified.Header().Get("Cache-Control") != immutableCache || notModified.Header().Get("ETag") != tile.Header().Get("ETag") {
+		t.Fatalf("conditional tile response: status=%d cache-control=%q etag=%q", notModified.Code, notModified.Header().Get("Cache-Control"), notModified.Header().Get("ETag"))
+	}
 	config, err := png.DecodeConfig(bytes.NewReader(tile.Body.Bytes()))
 	if err != nil || config.Width != tileSize || config.Height != tileSize {
 		t.Fatalf("tile config=%+v err=%v", config, err)
@@ -528,6 +635,9 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	if optionalMissing.Code != http.StatusNoContent || optionalMissing.Body.Len() != 0 {
 		t.Fatalf("optional missing tile returned status=%d body=%q, want empty 204", optionalMissing.Code, optionalMissing.Body.String())
 	}
+	if optionalMissing.Header().Get("Cache-Control") != immutableCache {
+		t.Fatalf("optional missing tile cache-control=%q, want %q", optionalMissing.Header().Get("Cache-Control"), immutableCache)
+	}
 
 	future := httptest.NewRecorder()
 	handler.ServeHTTP(future, httptest.NewRequest(http.MethodGet, "/tiles/999/13/0/0.png", nil))
@@ -539,11 +649,27 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	if futureOptional.Code != http.StatusNotFound {
 		t.Fatalf("unknown future version with optional lookup returned status %d, want 404", futureOptional.Code)
 	}
+	if futureOptional.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("unknown version cache-control=%q, want no-store", futureOptional.Header().Get("Cache-Control"))
+	}
+	for _, malformed := range []struct {
+		path string
+		want int
+	}{
+		{"/tiles/not-a-version/13/0/0.png", http.StatusBadRequest},
+		{"/tiles/1/13/0/0.jpg", http.StatusNotFound},
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, malformed.path, nil))
+		if response.Code != malformed.want || response.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("malformed path %q: status=%d cache-control=%q", malformed.path, response.Code, response.Header().Get("Cache-Control"))
+		}
+	}
 
 	invalidTile := httptest.NewRecorder()
 	handler.ServeHTTP(invalidTile, httptest.NewRequest(http.MethodGet, "/tiles/1/14/0/0.png", nil))
-	if invalidTile.Code != http.StatusBadRequest || invalidTile.Body.String() != "invalid tile coordinate\n" {
-		t.Fatalf("invalid tile returned status=%d body=%q", invalidTile.Code, invalidTile.Body.String())
+	if invalidTile.Code != http.StatusBadRequest || invalidTile.Body.String() != "invalid tile coordinate\n" || invalidTile.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("invalid tile returned status=%d body=%q cache-control=%q", invalidTile.Code, invalidTile.Body.String(), invalidTile.Header().Get("Cache-Control"))
 	}
 
 	broken, err := OpenArchive(filepath.Join(t.TempDir(), "broken.db"))
@@ -555,8 +681,8 @@ func TestHTTPServesViewerVersionMetadataAndPNGTile(t *testing.T) {
 	}
 	databaseFailure := httptest.NewRecorder()
 	NewHandler(broken).ServeHTTP(databaseFailure, httptest.NewRequest(http.MethodGet, path, nil))
-	if databaseFailure.Code != http.StatusInternalServerError || databaseFailure.Body.String() != "database error\n" {
-		t.Fatalf("database failure leaked as status=%d body=%q", databaseFailure.Code, databaseFailure.Body.String())
+	if databaseFailure.Code != http.StatusInternalServerError || databaseFailure.Body.String() != "database error\n" || databaseFailure.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("database failure leaked as status=%d body=%q cache-control=%q", databaseFailure.Code, databaseFailure.Body.String(), databaseFailure.Header().Get("Cache-Control"))
 	}
 }
 

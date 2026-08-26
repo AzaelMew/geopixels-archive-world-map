@@ -12,10 +12,11 @@ Grid cell `(x,y)` is centered at EPSG:3857 metres `(x*25,y*25)`. Y increases nor
 
 ## Build and test
 
-Requires Go 1.25+, a C compiler for `go-sqlite3`, and network access for MapLibre plus the GeoPixels vector tiles, sprites, and fonts.
+Requires Go 1.25+, a C compiler for `go-sqlite3`, Node.js for the viewer scheduling test, and network access for MapLibre plus the GeoPixels vector tiles, sprites, and fonts.
 
 ```sh
 go test ./...
+node --test viewer_test.js
 go vet ./...
 go build -o geopixels-archive .
 ```
@@ -121,6 +122,8 @@ curl -o tile.png http://127.0.0.1:8080/tiles/1/13/-1/0.png
 ```
 
 Open <http://127.0.0.1:8080/>. The version selector appears automatically when more than one dump is ingested. The browser uses the GeoPixels map style, converts the viewport to EPSG:3857, requests signed native tiles, and places each texture at its exact half-cell-adjusted projected bounds through GeoPixels' `PixelTileLayer`. Horizontal world copies repeat indefinitely while reusing canonical archive tiles. Map position and version are kept in the URL.
+
+Successful tiles and valid-version optional misses (`204 No Content`) return `Cache-Control: public, max-age=31536000, immutable`, so conventional reverse proxies and CDNs can cache `/tiles/*` without provider-specific configuration. Invalid versions, malformed requests, and server errors return `Cache-Control: no-store`.
 
 ## Deliberate MVP scope
 

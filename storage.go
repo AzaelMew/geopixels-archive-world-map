@@ -17,8 +17,9 @@ import (
 )
 
 type Archive struct {
-	DB       *sql.DB
-	readOnly bool
+	DB              *sql.DB
+	readOnly        bool
+	servingVersions map[int64]struct{}
 }
 
 const nativeTileFormatVersion = 1
@@ -133,7 +134,34 @@ func OpenArchiveForServing(path string) (*Archive, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Archive{DB: db, readOnly: true}, nil
+	archive := &Archive{DB: db, readOnly: true}
+	if err := archive.RequireNativeTileFormat(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	rows, err := db.Query("SELECT id FROM versions")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	versions := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			db.Close()
+			return nil, err
+		}
+		versions[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		db.Close()
+		return nil, err
+	}
+	rows.Close()
+	archive.servingVersions = versions
+	return archive, nil
 }
 
 func (a *Archive) Close() error {
@@ -152,6 +180,16 @@ func (a *Archive) RequireNativeTileFormat() error {
 		return fmt.Errorf("%w (found %d, need %d)", errIncompatibleTileFormat, version, nativeTileFormatVersion)
 	}
 	return nil
+}
+
+func (a *Archive) versionExists(versionID int64) (bool, error) {
+	if a.servingVersions != nil {
+		_, exists := a.servingVersions[versionID]
+		return exists, nil
+	}
+	var exists bool
+	err := a.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM versions WHERE id=?)", versionID).Scan(&exists)
+	return exists, err
 }
 
 func (a *Archive) IngestDump(dump *Dump, source string) (_ IngestResult, err error) {
@@ -565,13 +603,23 @@ func storeTile(tx *sql.Tx, versionID int64, zoom, x, y int, img image.Image) err
 }
 
 func (a *Archive) GetTile(versionID int64, zoom, x, y int) ([]byte, error) {
-	if err := a.RequireNativeTileFormat(); err != nil {
-		return nil, err
+	if a.servingVersions == nil {
+		if err := a.RequireNativeTileFormat(); err != nil {
+			return nil, err
+		}
 	}
 	if zoom < 0 || zoom > maxZoom {
 		return nil, fmt.Errorf("%w: %d/%d/%d", errInvalidTile, zoom, x, y)
 	}
 	var data []byte
+	if a.servingVersions != nil {
+		if _, exists := a.servingVersions[versionID]; !exists {
+			return nil, sql.ErrNoRows
+		}
+		err := a.DB.QueryRow(`SELECT data FROM tiles WHERE z=? AND x=? AND y=? AND version_id<=?
+			ORDER BY version_id DESC LIMIT 1`, zoom, x, y, versionID).Scan(&data)
+		return data, err
+	}
 	err := a.DB.QueryRow(`SELECT data FROM tiles WHERE z=? AND x=? AND y=? AND version_id<=?
 		AND EXISTS (SELECT 1 FROM versions WHERE id=?)
 		ORDER BY version_id DESC LIMIT 1`, zoom, x, y, versionID, versionID).Scan(&data)

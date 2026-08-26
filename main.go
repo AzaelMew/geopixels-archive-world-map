@@ -172,9 +172,6 @@ func run(args []string, output io.Writer) error {
 			return err
 		}
 		defer archive.Close()
-		if err := archive.RequireNativeTileFormat(); err != nil {
-			return err
-		}
 		fmt.Fprintf(output, "GeoPixels archive: http://%s\n", *listen)
 		server := &http.Server{Addr: *listen, Handler: NewHandler(archive), ReadHeaderTimeout: 5 * time.Second}
 		return server.ListenAndServe()

@@ -76,6 +76,19 @@
       }
       return tiles;
     }
+    function prioritizeNativeTiles(tiles,z,bounds){
+      const west=bounds.getWest(),east=bounds.getEast()<west?bounds.getEast()+360:bounds.getEast();
+      const centerX=(west+east)/360*mercatorHalfWorld;
+      const centerY=(latToMercatorY(bounds.getSouth())+latToMercatorY(bounds.getNorth()))/2;
+      const span=cellsPerTile(z),worldWidth=2*mercatorHalfWorld;
+      const distance=({x,y,world})=>{
+        const dx=(x*span+(span-1)/2)*gridSize+world*worldWidth-centerX;
+        const dy=(y*span+(span-1)/2)*gridSize-centerY;
+        return dx*dx+dy*dy;
+      };
+      return tiles.map((tile,index)=>({tile,index,distance:distance(tile)}))
+        .sort((a,b)=>a.distance-b.distance||a.index-b.index).map(({tile})=>tile);
+    }
     function nativeTileCorners(z,x,y,world=0){
       const span=cellsPerTile(z),gx0=x*span,gy0=y*span;
       // Grid coordinates are cell centres, so native tile boundaries are half a cell outside.
@@ -287,7 +300,7 @@
     async function performRefresh(version,z,signature,allowFallback){
       const generation=++refreshGeneration;
       const fetches=new Map(),visible=new Set(),background=[];
-      const targets=visibleNativeTiles(map.getBounds(),z),stage=displayedLevel!==null&&displayedLevel!==z;
+      const bounds=map.getBounds(),targets=prioritizeNativeTiles(visibleNativeTiles(bounds,z),z,bounds),stage=displayedLevel!==null&&displayedLevel!==z;
       const keep=new Set();
       for(const {x,y} of targets){
         keep.add(tileURL(version,z,x,y));
