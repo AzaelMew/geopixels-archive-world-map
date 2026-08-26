@@ -167,7 +167,7 @@ func run(args []string, output io.Writer) error {
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
-		archive, err := OpenArchive(*dbPath)
+		archive, err := OpenArchiveForServing(*dbPath)
 		if err != nil {
 			return err
 		}

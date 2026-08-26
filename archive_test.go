@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"image"
@@ -45,6 +47,55 @@ func TestNativeTileMappingUsesFloorDivision(t *testing.T) {
 		if got := gridCellTile(int32(grid), 0, maxZoom); got != (tileCoord{X: want, Y: 0}) {
 			t.Errorf("grid cell %d mapped to %+v, want x=%d y=0", grid, got, want)
 		}
+	}
+}
+
+func TestArchiveConnectionPoolsSeparateServingReadsFromWrites(t *testing.T) {
+	tempDir, err := os.MkdirTemp(".", "archive-serving-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+	dbPath := filepath.Join(tempDir, "archive.db")
+	writer, err := OpenArchive(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := writer.DB.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("write archive has %d max connections, want 1", got)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenArchiveForServing(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if got := reader.DB.Stats().MaxOpenConnections; got != 4 {
+		t.Fatalf("serving archive has %d max connections, want 4", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	connections := make([]*sql.Conn, 0, 4)
+	for range 4 {
+		connection, err := reader.DB.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, connection)
+	}
+	for _, connection := range connections {
+		if err := connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := reader.DB.Stats().Idle; got != 4 {
+		t.Fatalf("serving archive retained %d idle connections, want 4", got)
+	}
+	if _, err := reader.DB.Exec(`INSERT INTO versions(label,timestamp,source,event_count,declared_count,deletion_count)
+		VALUES('should-fail',0,'test',0,0,0)`); err == nil {
+		t.Fatal("serving archive allowed a write")
 	}
 }
 
@@ -165,6 +216,7 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 		"<script src=\"/pixel-tile-layer.js\"></script>",
 		"new PixelTileLayer('pixel-tiles')",
 		"function nativeTileRange(bounds,z)",
+		"return {minX,maxX,minY,maxY}",
 		"function visibleNativeTiles(bounds,z)",
 		"Math.floor((bounds.getWest()+180)/360)",
 		"world*360",
@@ -189,12 +241,26 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 		"touchLoadedTile(fallbackKey",
 		"new AbortController()",
 		"Failed to decode detail tile",
+		"generation!==refreshGeneration)return {kind:'detail',stale:true}",
+		"if(generation!==refreshGeneration){if(result.bitmap)result.bitmap.close();return false}",
 		"Promise.allSettled(background)",
-		"for(const entry of pixelTileLayer.tiles.values())entry.hidden=true",
+		"Math.floor(map.getZoom())",
+		"const nativeZoomThreshold=10.5",
+		"map.getZoom()>=nativeZoomThreshold?maxDataZoom-1",
+		"map.getZoom()>=nativeZoomThreshold?maxDataZoom",
+		"movingDataLevel()+1",
+		"const inFlightTiles=new Map()",
+		"const fetches=new Map()",
+		"inFlightTiles.get(url)",
+		"activeRefresh.signature===coarseSignature",
+		"activeRefresh.promise.then(complete=>complete?true:",
+		"refreshTiles(coarseZ,true)",
+		"if(!complete||version!==archiveVersion",
+		"touchLoadedTile(key,visible,stage)",
 		"const fallbackDelayMs=300",
 		"suppressFallback",
-		"function viewportSignature()",
-		"function scheduleTileRefresh(allowFallback)",
+		"function viewportSignature(z=movingDataLevel())",
+		"function scheduleTileRefresh(settled)",
 		"map.on('move',()=>scheduleTileRefresh(false))",
 		"map.on('moveend',()=>scheduleTileRefresh(true))",
 		"displayedLevel!==z",
@@ -217,6 +283,9 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 	}
 	if strings.Contains(html, "if(!active.has(key))pixelTileLayer.removeTile(key)") {
 		t.Fatal("viewer still evicts every off-screen tile immediately")
+	}
+	if strings.Contains(html, "minX:minX-1") || strings.Contains(html, "if(refreshController)refreshController.abort()") {
+		t.Fatal("viewer still pads every viewport or aborts every refresh wholesale")
 	}
 	if strings.Contains(html, "showOnlyLevel") || strings.Contains(html, "const levels=[") {
 		t.Fatal("viewer still replaces the whole viewport with a low-resolution level")
