@@ -58,6 +58,8 @@ type Version struct {
 	Deletions     int    `json:"deletions"`
 }
 
+const immutableTileCacheControl = "public, max-age=31536000, immutable"
+
 func (v Version) IDString() string { return strconv.FormatInt(v.ID, 10) }
 
 func NewHandler(archive *Archive) http.Handler {
@@ -132,6 +134,7 @@ func NewHandler(archive *Archive) http.Handler {
 		_ = json.NewEncoder(w).Encode(versions)
 	})
 	mux.HandleFunc("GET /tiles/{version}/{z}/{x}/{file}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		version, err := strconv.ParseInt(r.PathValue("version"), 10, 64)
 		if err != nil {
 			http.Error(w, "invalid version", http.StatusBadRequest)
@@ -157,12 +160,13 @@ func NewHandler(archive *Archive) http.Handler {
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			if r.URL.Query().Get("optional") == "1" {
-				var versionExists bool
-				if queryErr := archive.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM versions WHERE id=?)", version).Scan(&versionExists); queryErr != nil {
+				versionExists, queryErr := archive.versionExists(version)
+				if queryErr != nil {
 					http.Error(w, "database error", http.StatusInternalServerError)
 					return
 				}
 				if versionExists {
+					w.Header().Set("Cache-Control", immutableTileCacheControl)
 					w.WriteHeader(http.StatusNoContent)
 					return
 				}
@@ -175,13 +179,13 @@ func NewHandler(archive *Archive) http.Handler {
 			return
 		}
 		etag := fmt.Sprintf(`"%d-%d-%d-%d"`, version, coordinates[0], coordinates[1], coordinates[2])
+		w.Header().Set("Cache-Control", immutableTileCacheControl)
+		w.Header().Set("ETag", etag)
 		if r.Header.Get("If-None-Match") == etag {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
 		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		w.Header().Set("ETag", etag)
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		_, _ = w.Write(data)
 	})
