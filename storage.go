@@ -9,12 +9,17 @@ import (
 	"image/draw"
 	"image/png"
 	"io"
+	"net/url"
+	"path/filepath"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-type Archive struct{ DB *sql.DB }
+type Archive struct {
+	DB       *sql.DB
+	readOnly bool
+}
 
 const nativeTileFormatVersion = 1
 
@@ -39,7 +44,7 @@ func OpenArchive(path string) (*Archive, error) {
 	if err != nil {
 		return nil, err
 	}
-	// ponytail: serialize SQLite access; raise this only if local read throughput matters.
+	// Write-oriented archives stay serialized; the serving path raises this after setup.
 	db.SetMaxOpenConns(1)
 	var existingSchema int
 	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('versions','tiles')").Scan(&existingSchema); err != nil {
@@ -98,8 +103,35 @@ func OpenArchive(path string) (*Archive, error) {
 	return &Archive{DB: db}, nil
 }
 
+func OpenArchiveForServing(path string) (*Archive, error) {
+	filename, rawQuery, _ := strings.Cut(path, "?")
+	filename, err := filepath.Abs(filename)
+	if err != nil {
+		return nil, err
+	}
+	dsn := &url.URL{Scheme: "file", Path: filename, RawQuery: rawQuery}
+	query := dsn.Query()
+	query.Del("_txlock")
+	query.Set("mode", "ro")
+	query.Set("_busy_timeout", "20000")
+	dsn.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite3", dsn.String())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Archive{DB: db, readOnly: true}, nil
+}
+
 func (a *Archive) Close() error {
-	_, _ = a.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	if !a.readOnly {
+		_, _ = a.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	}
 	return a.DB.Close()
 }
 

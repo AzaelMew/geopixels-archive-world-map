@@ -23,13 +23,14 @@
     const gridSize=25,tileSize=256,maxDataZoom=13,earthRadius=6378137,mercatorHalfWorld=Math.PI*earthRadius;
     const params=new URLSearchParams(location.search);
     const select=document.querySelector('#version'),status=document.querySelector('#status');
-    let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0,refreshController=null,displayedLevel=null,lastViewportSignature='';
+    let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0,displayedLevel=null,lastViewportSignature='',activeRefresh=null;
     const maxCachedTiles=256;
     const fallbackDelayMs=300;
     const tileLoadConcurrency=4;
     const moveRefreshDelayMs=100;
     const tileUsage=new Map();
     const missingTiles=new Set();
+    const inFlightTiles=new Map();
     let usageTick=0,moveRefreshTimer=0;
     const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:true,dragRotate:false,style:'/map-style.json'});
     map.addControl(new maplibregl.NavigationControl());
@@ -58,7 +59,7 @@
       const south=latToMercatorY(bounds.getSouth()),north=latToMercatorY(bounds.getNorth());
       const tileFor=(mx,my)=>[Math.floor((mx/gridSize+0.5)/span),Math.floor((my/gridSize+0.5)/span)];
       const [minX,minY]=tileFor(Math.min(west,east),south),[maxX,maxY]=tileFor(Math.max(west,east),north);
-      return {minX:minX-1,maxX:maxX+1,minY:minY-1,maxY:maxY+1};
+      return {minX,maxX,minY,maxY};
     }
     function visibleNativeTiles(bounds,z){
       const tiles=[],west=bounds.getWest(),east=bounds.getEast()<west?bounds.getEast()+360:bounds.getEast();
@@ -83,40 +84,66 @@
       return [projectedToLngLat(west,south),projectedToLngLat(east,south),projectedToLngLat(east,north),projectedToLngLat(west,north)]
         .map(([lng,lat])=>[lng+world*360,lat]);
     }
-    const dataLevel=()=>clamp(Math.ceil(map.getZoom())+1,0,maxDataZoom);
-    function viewportSignature(){
-      const z=dataLevel();
+    const nativeZoomThreshold=10.5;
+    const movingDataLevel=()=>map.getZoom()>=nativeZoomThreshold?maxDataZoom:clamp(Math.floor(map.getZoom()),0,maxDataZoom);
+    const settledDataLevel=()=>map.getZoom()>=nativeZoomThreshold?maxDataZoom:clamp(movingDataLevel()+1,0,maxDataZoom);
+    function viewportSignature(z=movingDataLevel()){
       return `${archiveVersion}/${z}/`+visibleNativeTiles(map.getBounds(),z).map(({x,y,world})=>`${x}/${y}@${world}`).join(',');
     }
-    function scheduleTileRefresh(allowFallback){
+    function scheduleTileRefresh(settled){
       if(!pixelTileLayer||!archiveVersion)return;
-      if(allowFallback){
+      if(settled){
         if(moveRefreshTimer){clearTimeout(moveRefreshTimer);moveRefreshTimer=0}
-        lastViewportSignature=viewportSignature();refreshTiles(true);return;
+        const version=archiveVersion,coarseZ=movingDataLevel(),coarseSignature=viewportSignature(coarseZ);
+        const coarse=activeRefresh&&activeRefresh.signature===coarseSignature?
+          activeRefresh.promise.then(complete=>complete?true:
+            version===archiveVersion&&coarseSignature===viewportSignature(coarseZ)&&refreshTiles(coarseZ,true)):
+          lastViewportSignature===coarseSignature&&displayedLevel===coarseZ?Promise.resolve(true):refreshTiles(coarseZ,true);
+        Promise.resolve(coarse).then(complete=>{
+          if(!complete||version!==archiveVersion||coarseSignature!==viewportSignature(coarseZ))return;
+          const detailZ=settledDataLevel();
+          if(detailZ!==coarseZ)refreshTiles(detailZ,false);
+        });
+        return;
       }
       if(moveRefreshTimer)return;
       moveRefreshTimer=setTimeout(()=>{
         moveRefreshTimer=0;
-        const signature=viewportSignature();
+        const z=movingDataLevel(),signature=viewportSignature(z);
         if(signature===lastViewportSignature)return;
-        lastViewportSignature=signature;refreshTiles(false);
+        refreshTiles(z,false);
       },moveRefreshDelayMs);
     }
 
-    async function fetchTileBlob(version,z,x,y,fetches,signal){
-      const url=`/tiles/${version}/${z}/${x}/${y}.png?optional=1`;
+    const tileURL=(version,z,x,y)=>`/tiles/${version}/${z}/${x}/${y}.png?optional=1`;
+    async function fetchTileBlob(version,z,x,y,fetches){
+      const url=tileURL(version,z,x,y);
       if(missingTiles.has(url))return null;
-      if(!fetches.has(url))fetches.set(url,(async()=>{
-        const response=await fetch(url,{signal});
-        if(response.status===204||response.status===404){
-          missingTiles.add(url);
-          if(missingTiles.size>5000)missingTiles.delete(missingTiles.values().next().value);
-          return null;
-        }
-        if(!response.ok)throw new Error(`Tile ${z}/${x}/${y}: ${response.status}`);
-        return response.blob();
-      })());
-      return fetches.get(url);
+      if(fetches.has(url))return fetches.get(url);
+      const existing=inFlightTiles.get(url);
+      let promise=existing&&existing.promise;
+      if(!promise){
+        const controller=new AbortController();
+        promise=(async()=>{
+          const response=await fetch(url,{signal:controller.signal});
+          if(response.status===204||response.status===404){
+            missingTiles.add(url);
+            if(missingTiles.size>5000)missingTiles.delete(missingTiles.values().next().value);
+            return null;
+          }
+          if(!response.ok)throw new Error(`Tile ${z}/${x}/${y}: ${response.status}`);
+          return response.blob();
+        })().finally(()=>{if(inFlightTiles.get(url)?.promise===promise)inFlightTiles.delete(url)});
+        inFlightTiles.set(url,{controller,promise});
+      }
+      fetches.set(url,promise);
+      return promise;
+    }
+    function abortObsoleteTileRequests(keep){
+      for(const [url,request] of inFlightTiles){
+        if(keep.has(url))continue;
+        request.controller.abort();inFlightTiles.delete(url);
+      }
     }
 
     const floorMod=(value,divisor)=>((value%divisor)+divisor)%divisor;
@@ -129,11 +156,11 @@
       });
     }
 
-    async function loadFallbackForTile(version,z,x,y,world,generation,fetches,signal){
+    async function loadFallbackForTile(version,z,x,y,world,generation,fetches){
       for(let delta=1;delta<=2&&z-delta>=0;delta++){
         const scale=Math.pow(2,delta),parentZ=z-delta,parentX=Math.floor(x/scale),parentY=Math.floor(y/scale);
         try{
-          const blob=await fetchTileBlob(version,parentZ,parentX,parentY,fetches,signal);
+          const blob=await fetchTileBlob(version,parentZ,parentX,parentY,fetches);
           if(generation!==refreshGeneration)return null;
           if(!blob)continue;
           const bitmap=await cropParentTile(blob,x,y,delta);
@@ -141,17 +168,17 @@
           return {key:`fallback/${version}/${z}/${x}/${y}@${world}`,bitmap,corners:nativeTileCorners(z,x,y,world)};
         }catch(error){
           if(error.name!=='AbortError')console.error(error);
-          if(signal.aborted)return null;
+          if(generation!==refreshGeneration)return null;
         }
       }
       return null;
     }
 
-    function touchLoadedTile(key,needed){
+    function touchLoadedTile(key,needed,hidden=false){
       const entry=pixelTileLayer.tiles.get(key);
       if(!entry)return false;
       pixelTileLayer.tiles.delete(key);pixelTileLayer.tiles.set(key,entry);
-      entry.hidden=false;
+      entry.hidden=hidden;
       tileUsage.set(key,++usageTick);needed.add(key);
       return true;
     }
@@ -169,23 +196,24 @@
     }
     function clearTileCache(){
       refreshGeneration++;
-      if(refreshController)refreshController.abort();
-      refreshController=null;
+      for(const request of inFlightTiles.values())request.controller.abort();
+      inFlightTiles.clear();activeRefresh=null;
       if(moveRefreshTimer){clearTimeout(moveRefreshTimer);moveRefreshTimer=0}
       if(pixelTileLayer)pixelTileLayer.clear();
       tileUsage.clear();usageTick=0;displayedLevel=null;lastViewportSignature='';
     }
 
-    async function loadTargetTile(version,z,x,y,world,generation,fetches,visible,signal,background,allowFallback){
+    async function loadTargetTile(version,z,x,y,world,generation,fetches,visible,background,allowFallback,stage){
       const key=`${version}/${z}/${x}/${y}@${world}`,fallbackKey=`fallback/${version}/${z}/${x}/${y}@${world}`;
-      if(touchLoadedTile(key,visible)){
+      if(touchLoadedTile(key,visible,stage)){
         if(pixelTileLayer.hasTile(fallbackKey)){pixelTileLayer.removeTile(fallbackKey);tileUsage.delete(fallbackKey)}
-        return;
+        return true;
       }
-      const reusedFallback=touchLoadedTile(fallbackKey,visible);
+      const reusedFallback=touchLoadedTile(fallbackKey,visible,stage);
       let suppressFallback=false;
-      const detailPromise=fetchTileBlob(version,z,x,y,fetches,signal)
+      const detailPromise=fetchTileBlob(version,z,x,y,fetches)
         .then(async blob=>{
+          if(generation!==refreshGeneration)return {kind:'detail',stale:true}
           if(blob===null){suppressFallback=true;return {kind:'detail',blob:null}}
           try{
             const bitmap=await createImageBitmap(blob,{imageOrientation:'flipY'});
@@ -198,26 +226,27 @@
         .catch(error=>{if(error.name!=='AbortError')console.error(error);return {kind:'detail',error}});
       const fallbackPromise=(reusedFallback||!allowFallback?Promise.resolve(null):
         new Promise(resolve=>setTimeout(resolve,fallbackDelayMs))
-          .then(()=>suppressFallback||signal.aborted?null:loadFallbackForTile(version,z,x,y,world,generation,fetches,signal)))
+          .then(()=>suppressFallback||generation!==refreshGeneration?null:loadFallbackForTile(version,z,x,y,world,generation,fetches)))
         .then(tile=>({kind:'fallback',tile}));
       const removeFallback=()=>{
         if(pixelTileLayer.hasTile(fallbackKey))pixelTileLayer.removeTile(fallbackKey);
         tileUsage.delete(fallbackKey);visible.delete(fallbackKey);
       };
       const applyFallback=result=>{
-        if(!result||!result.tile)return;
-        if(generation!==refreshGeneration){result.tile.bitmap.close();return}
+        if(!result||!result.tile)return false;
+        if(generation!==refreshGeneration){result.tile.bitmap.close();return false}
         pixelTileLayer.setTile(result.tile.key,result.tile.bitmap,result.tile.corners);result.tile.bitmap.close();
-        if(pixelTileLayer.hasTile(result.tile.key))touchLoadedTile(result.tile.key,visible);
+        if(pixelTileLayer.hasTile(result.tile.key))touchLoadedTile(result.tile.key,visible,stage);
+        return true;
       };
       const applyDetail=async result=>{
-        if(generation!==refreshGeneration||!result||result.error)return false;
+        if(!result||result.error)return false;
+        if(generation!==refreshGeneration){if(result.bitmap)result.bitmap.close();return false}
         if(result.blob===null){removeFallback();return true}
         const bitmap=result.bitmap;
         if(!bitmap)return false;
-        if(generation!==refreshGeneration){bitmap.close();return false}
         pixelTileLayer.setTile(key,bitmap,nativeTileCorners(z,x,y,world));bitmap.close();
-        if(pixelTileLayer.hasTile(key))touchLoadedTile(key,visible);
+        if(pixelTileLayer.hasTile(key))touchLoadedTile(key,visible,stage);
         removeFallback();return true;
       };
       const first=await Promise.race([detailPromise,fallbackPromise]);
@@ -229,56 +258,79 @@
           if(first.bitmap)first.bitmap.close();
           background.push(fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()}));
         }
-        return;
+        return false;
       }
       if(first.kind==='detail'){
         if(await applyDetail(first)){
-          background.push(fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()}));return;
+          background.push(fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()}));return true;
         }
-        if(reusedFallback)return;
-        applyFallback(await fallbackPromise);return;
+        if(reusedFallback)return true;
+        return applyFallback(await fallbackPromise);
       }
-      applyFallback(first);
-      await applyDetail(await detailPromise);
+      const fallbackApplied=applyFallback(first);
+      return await applyDetail(await detailPromise)||fallbackApplied;
     }
 
     async function runTilePool(items,worker){
       let cursor=0;
+      const results=new Array(items.length);
       const run=async()=>{
         while(cursor<items.length){
           const index=cursor++;
-          await worker(items[index]);
+          results[index]=await worker(items[index]);
         }
       };
       await Promise.all(Array.from({length:Math.min(tileLoadConcurrency,items.length)},run));
+      return results;
     }
 
-    async function refreshTiles(allowFallback=true){
-      if(!pixelTileLayer||!archiveVersion)return;
-      if(refreshController)refreshController.abort();
-      const controller=new AbortController();refreshController=controller;
-      const generation=++refreshGeneration,z=dataLevel(),visible=new Set(),fetches=new Map(),background=[];
-      lastViewportSignature=viewportSignature();
-      const targets=visibleNativeTiles(map.getBounds(),z);
-      if(displayedLevel!==z)for(const entry of pixelTileLayer.tiles.values())entry.hidden=true;
-      if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
-      await runTilePool(targets,({x,y,world})=>loadTargetTile(archiveVersion,z,x,y,world,generation,fetches,visible,controller.signal,background,allowFallback));
-      if(generation!==refreshGeneration)return;
-      for(const [key,entry] of pixelTileLayer.tiles){
-        if(key.startsWith('fallback/')&&!visible.has(key)){pixelTileLayer.removeTile(key);tileUsage.delete(key);continue}
-        entry.hidden=!visible.has(key);
+    async function performRefresh(version,z,signature,allowFallback){
+      const generation=++refreshGeneration;
+      const fetches=new Map(),visible=new Set(),background=[];
+      const targets=visibleNativeTiles(map.getBounds(),z),stage=displayedLevel!==null&&displayedLevel!==z;
+      const keep=new Set();
+      for(const {x,y} of targets){
+        keep.add(tileURL(version,z,x,y));
+        if(!allowFallback)continue;
+        for(let delta=1;delta<=2&&z-delta>=0;delta++){
+          const scale=Math.pow(2,delta);
+          keep.add(tileURL(version,z-delta,Math.floor(x/scale),Math.floor(y/scale)));
+        }
       }
-      if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
-      evictTileCache(visible);
-      displayedLevel=z;
-      Promise.allSettled(background).then(()=>{if(refreshController===controller)refreshController=null});
+      abortObsoleteTileRequests(keep);
+      const results=await runTilePool(targets,({x,y,world})=>generation===refreshGeneration&&
+        loadTargetTile(version,z,x,y,world,generation,fetches,visible,background,allowFallback,stage));
+      if(version!==archiveVersion||generation!==refreshGeneration)return false;
+      const complete=results.every(Boolean);
+      if(!complete&&stage)return false;
+      if(complete){
+        for(const [key,entry] of pixelTileLayer.tiles){
+          if(key.startsWith('fallback/')&&!visible.has(key)){pixelTileLayer.removeTile(key);tileUsage.delete(key);continue}
+          entry.hidden=!visible.has(key);
+        }
+        displayedLevel=z;lastViewportSignature=signature;
+        if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
+        evictTileCache(visible);
+      }
+      Promise.allSettled(background);
+      return complete;
+    }
+
+    function refreshTiles(z,allowFallback=true){
+      if(!pixelTileLayer||!archiveVersion)return Promise.resolve(false);
+      const version=archiveVersion,signature=viewportSignature(z);
+      if(activeRefresh&&activeRefresh.signature===signature)return activeRefresh.promise;
+      const promise=performRefresh(version,z,signature,allowFallback);
+      activeRefresh={signature,promise};
+      promise.finally(()=>{if(activeRefresh?.promise===promise)activeRefresh=null});
+      return promise;
     }
 
     function showVersion(id){
       archiveVersion=String(id);
       clearTileCache();
       params.set('version',archiveVersion);history.replaceState(null,'',`${location.pathname}?${params}`);
-      refreshTiles();
+      scheduleTileRefresh(true);
     }
     function updateUrl(){
       const center=map.getCenter();params.set('lng',center.lng.toFixed(6));params.set('lat',center.lat.toFixed(6));params.set('zoom',map.getZoom().toFixed(2));
@@ -287,7 +339,7 @@
 
     map.on('style.load',()=>{
       map.setProjection({type:'mercator'});
-      if(pixelTileLayer&&!map.getLayer(pixelTileLayer.id)){clearTileCache();map.addLayer(pixelTileLayer);refreshTiles()}
+      if(pixelTileLayer&&!map.getLayer(pixelTileLayer.id)){clearTileCache();map.addLayer(pixelTileLayer);scheduleTileRefresh(true)}
     });
     map.on('load',async()=>{
       pixelTileLayer=new PixelTileLayer('pixel-tiles');
