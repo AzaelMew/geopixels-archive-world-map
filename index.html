@@ -85,7 +85,7 @@
         .map(([lng,lat])=>[lng+world*360,lat]);
     }
     const nativeZoomThreshold=10.5;
-    const movingDataLevel=()=>map.getZoom()>=nativeZoomThreshold?maxDataZoom-1:clamp(Math.floor(map.getZoom()),0,maxDataZoom);
+    const movingDataLevel=()=>map.getZoom()>=nativeZoomThreshold?maxDataZoom:clamp(Math.floor(map.getZoom()),0,maxDataZoom);
     const settledDataLevel=()=>map.getZoom()>=nativeZoomThreshold?maxDataZoom:clamp(movingDataLevel()+1,0,maxDataZoom);
     function viewportSignature(z=movingDataLevel()){
       return `${archiveVersion}/${z}/`+visibleNativeTiles(map.getBounds(),z).map(({x,y,world})=>`${x}/${y}@${world}`).join(',');

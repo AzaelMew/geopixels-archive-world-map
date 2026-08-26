@@ -246,7 +246,7 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 		"Promise.allSettled(background)",
 		"Math.floor(map.getZoom())",
 		"const nativeZoomThreshold=10.5",
-		"map.getZoom()>=nativeZoomThreshold?maxDataZoom-1",
+		"const movingDataLevel=()=>map.getZoom()>=nativeZoomThreshold?maxDataZoom:",
 		"map.getZoom()>=nativeZoomThreshold?maxDataZoom",
 		"movingDataLevel()+1",
 		"const inFlightTiles=new Map()",
