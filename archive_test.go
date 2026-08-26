@@ -50,6 +50,14 @@ func TestNativeTileMappingUsesFloorDivision(t *testing.T) {
 	}
 }
 
+func TestReadOnlySQLiteURISupportsWindowsDrivePaths(t *testing.T) {
+	got := readOnlySQLiteURI(`C:\Users\ThinkPad\Documents\Archive\data\archive.db`, `_txlock=immediate&cache=shared`)
+	want := `file:///C:/Users/ThinkPad/Documents/Archive/data/archive.db?_busy_timeout=20000&cache=shared&mode=ro`
+	if got != want {
+		t.Fatalf("Windows read-only SQLite URI = %q, want %q", got, want)
+	}
+}
+
 func TestArchiveConnectionPoolsSeparateServingReadsFromWrites(t *testing.T) {
 	tempDir, err := os.MkdirTemp(".", "archive-serving-")
 	if err != nil {
