@@ -103,11 +103,10 @@ func OpenArchive(path string) (*Archive, error) {
 	return &Archive{DB: db}, nil
 }
 
-func OpenArchiveForServing(path string) (*Archive, error) {
-	filename, rawQuery, _ := strings.Cut(path, "?")
-	filename, err := filepath.Abs(filename)
-	if err != nil {
-		return nil, err
+func readOnlySQLiteURI(filename, rawQuery string) string {
+	filename = strings.ReplaceAll(filename, `\`, "/")
+	if len(filename) >= 2 && filename[1] == ':' {
+		filename = "/" + filename
 	}
 	dsn := &url.URL{Scheme: "file", Path: filename, RawQuery: rawQuery}
 	query := dsn.Query()
@@ -115,7 +114,16 @@ func OpenArchiveForServing(path string) (*Archive, error) {
 	query.Set("mode", "ro")
 	query.Set("_busy_timeout", "20000")
 	dsn.RawQuery = query.Encode()
-	db, err := sql.Open("sqlite3", dsn.String())
+	return dsn.String()
+}
+
+func OpenArchiveForServing(path string) (*Archive, error) {
+	filename, rawQuery, _ := strings.Cut(path, "?")
+	filename, err := filepath.Abs(filename)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", readOnlySQLiteURI(filename, rawQuery))
 	if err != nil {
 		return nil, err
 	}
