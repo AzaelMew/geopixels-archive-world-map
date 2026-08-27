@@ -285,6 +285,35 @@ test('aborted edge coverage does not hide completed center native tiles', async 
   assert.equal(layer.tiles.get('v/12/2/0@0').hidden, false);
 });
 
+test('transient native failure shows z12 coverage but keeps the refresh incomplete for retry', async () => {
+  const flaky = deferred();
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', flaky.promise.then(() => { throw new Error('flaky'); })],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  const first = viewer.performRefresh('v', 13, 'sigA', true);
+  await spinUntil(() => layer.hasTile('fallback/v/13/0/0@0'), 'fallback coverage never appeared after native failure');
+  flaky.resolve();
+  assert.equal(await first, false, 'failed native tile must not report the viewport complete');
+  const state = viewer.getState();
+  assert.notEqual(state.lastViewportSignature, 'sigA', 'completed signature would suppress every retry');
+  assert.equal(state.displayedLevel, 12);
+
+  fetchResponses.set('/tiles/v/13/0/0.png?optional=1', response());
+  assert.equal(await viewer.performRefresh('v', 13, 'sigB', true), true);
+  assert.equal(layer.hasTile('fallback/v/13/0/0@0'), false);
+  assert.equal(layer.tiles.get('v/13/0/0@0').hidden, false);
+  const settled = viewer.getState();
+  assert.equal(settled.displayedLevel, 13);
+  assert.equal(settled.lastViewportSignature, 'sigB');
+});
+
 test('intentional missing native tile retains its z12 transitional coverage', async () => {
   const fetchResponses = new Map([
     ['/tiles/v/13/-1/0.png?optional=1', response(204)],

@@ -282,11 +282,21 @@
         if(await applyDetail(first)){
           background.push(fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()}));return true;
         }
+        // ponytail: never report a failed native tile as done just because z12 covered it;
+        // recording completion would suppress all retries of that tile.
+        const failedNative=first.error&&z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold;
+        if(failedNative)return false;
         if(reusedFallback)return true;
         return applyFallback(await fallbackPromise);
       }
+      // ponytail: never report a failed native tile as done just because z12 covered it;
+      // recording completion would suppress all retries of that tile.
+      const nativeFailed=result=>!!(result&&result.error&&z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold);
       const fallbackApplied=applyFallback(first);
-      return await applyDetail(await detailPromise)||fallbackApplied;
+      const detailResult=await detailPromise;
+      if(await applyDetail(detailResult))return true;
+      if(nativeFailed(detailResult))return false;
+      return fallbackApplied;
     }
 
     async function runTilePool(items,worker){
