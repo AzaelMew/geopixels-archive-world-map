@@ -107,6 +107,9 @@
     function scheduleTileRefresh(settled){
       if(!pixelTileLayer||!archiveVersion)return;
       if(settled){
+        // A user/load settle starts a fresh retry context. Automatic retries
+        // call refreshTiles directly, so they keep their current attempt count.
+        cancelNativeRetry();nativeRetryAttempt=0;
         if(moveRefreshTimer){clearTimeout(moveRefreshTimer);moveRefreshTimer=0}
         const version=archiveVersion,coarseZ=movingDataLevel(),coarseSignature=viewportSignature(coarseZ);
         const coarse=activeRefresh&&activeRefresh.signature===coarseSignature?
@@ -147,7 +150,7 @@
       if(lastViewportSignature===viewportSignature(detailZ)){nativeRetryAttempt=0;return} // completed
       if(detailZ!==maxDataZoom||map.getZoom()<nativeZoomThreshold)return;
       if(nativeRetryAttempt>=nativeRetryMaxAttempts)return;
-      const epoch=nativeRetryEpoch,version=archiveVersion,signature=viewportSignature(detailZ);
+      const epoch=nativeRetryEpoch,version=archiveVersion,signature=viewportSignature(detailZ),zoom=map.getZoom();
       retryTimer=setTimeout(async()=>{
         retryTimer=0;
         // ponytail: retry identity is its own epoch, decoupled from
@@ -155,10 +158,11 @@
         // design and must not look like external invalidation. In-flight
         // sharing + supersede-by-signature still dedupe redundant calls.
         if(epoch!==nativeRetryEpoch||version!==archiveVersion)return;
-        if(map.getZoom()<nativeZoomThreshold)return;
+        if(zoom!==map.getZoom()||map.getZoom()<nativeZoomThreshold||settledDataLevel()!==detailZ)return;
         if(signature!==viewportSignature(detailZ))return;
-        const complete=await refreshTiles(detailZ,false);
-        if(epoch!==nativeRetryEpoch)return;
+        const complete=await refreshTiles(detailZ,true);
+        if(epoch!==nativeRetryEpoch||version!==archiveVersion)return;
+        if(zoom!==map.getZoom()||signature!==viewportSignature(detailZ)||settledDataLevel()!==detailZ)return;
         if(complete){nativeRetryAttempt=0;return}
         nativeRetryAttempt++;
         scheduleNativeRetry(detailZ);
@@ -392,11 +396,13 @@
       // target) instead of displayedLevel — a z11 parent spans 16 z13 children,
       // so one slow child could withhold 15 ready siblings; z12 regions cap
       // that blast radius at 4 while keeping parent-atomic reveal.
-      const transitionLevel=progressiveNative&&displayedLevel!==null&&displayedLevel<z?Math.min(displayedLevel,z-1):null;
+      const transitionLevel=progressiveNative&&displayedLevel!==null&&displayedLevel<z?z-1:null;
       const stage=displayedLevel!==null&&displayedLevel!==z;
-      const targetGroups=new Map(),coverageGroups=new Map();
+      const targetGroups=new Map(),coverageGroups=new Map(),targetCoarseGroups=new Map(),coarseGroups=new Map();
+      let markCoverage=()=>{};
       if(transitionLevel!==null){
         const scale=Math.pow(2,z-transitionLevel);
+        const coarseScale=displayedLevel<transitionLevel?Math.pow(2,z-displayedLevel):0;
         for(const {x,y,world} of targets){
           const targetId=`${x}/${y}@${world}`;
           const parentX=Math.floor(x/scale),parentY=Math.floor(y/scale);
@@ -408,37 +414,64 @@
             coverageGroups.set(groupId,group);
           }
           group.targets.add(targetId);targetGroups.set(targetId,group);
+          if(coarseScale){
+            const coarseX=Math.floor(x/coarseScale),coarseY=Math.floor(y/coarseScale);
+            const coarseId=`${coarseX}/${coarseY}@${world}`;
+            let coarse=coarseGroups.get(coarseId);
+            if(!coarse){
+              const parentKey=`${version}/${displayedLevel}/${coarseX}/${coarseY}@${world}`;
+              coarse={parentKeys:[parentKey,`fallback/${parentKey}`],targets:new Set(),ready:new Set(),groups:new Set(),revealed:false};
+              coarseGroups.set(coarseId,coarse);
+            }
+            coarse.targets.add(targetId);coarse.groups.add(group);group.coarse=coarse;targetCoarseGroups.set(targetId,coarse);
+          }
           const childBase=`${version}/${z}/${x}/${y}@${world}`;
           // An earlier refresh may have already revealed this child (or its
           // retained fallback): keep it settled instead of flashing coarse.
           const live=pixelTileLayer.tiles.get(childBase)||pixelTileLayer.tiles.get(`fallback/${childBase}`);
-          if(live&&!live.hidden){group.settled.set(targetId,live);settledCoverage.add(live===pixelTileLayer.tiles.get(childBase)?childBase:`fallback/${childBase}`);continue}
+          if(live&&!live.hidden){
+            group.settled.set(targetId,live);settledCoverage.add(live===pixelTileLayer.tiles.get(childBase)?childBase:`fallback/${childBase}`);
+            const coarse=targetCoarseGroups.get(targetId);if(coarse)coarse.ready.add(targetId);
+            continue;
+          }
           for(const childKey of [childBase,`fallback/${childBase}`]){
             const entry=pixelTileLayer.tiles.get(childKey);if(entry)entry.hidden=true;
           }
         }
-        for(const group of coverageGroups.values()){
-          if(group.settled.size===group.targets.size){
-            group.revealed=true;
-            for(const entry of group.settled.values())entry.hidden=false;
-            continue;
-          }
-          if(group.revealed)continue;
-          for(const parentKey of group.parentKeys){
-            const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=false;
-          }
+        const groupCovered=group=>[...group.targets].every(id=>group.ready.has(id)||group.settled.has(id));
+        const revealGroup=group=>{
+          if(group.revealed)return;
+          for(const parentKey of group.parentKeys){const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=true}
+          for(const entry of group.settled.values())entry.hidden=false;
+          for(const childKey of group.current.values()){const entry=pixelTileLayer.tiles.get(childKey);if(entry)entry.hidden=false}
+          group.revealed=true;
+        };
+        const revealCoarse=coarse=>{
+          if(coarse.revealed)return;
+          for(const parentKey of coarse.parentKeys){const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=true}
+          coarse.revealed=true;
+          for(const group of coarse.groups)if(groupCovered(group))revealGroup(group);
+        };
+        for(const coarse of coarseGroups.values()){
+          if(coarse.ready.size===coarse.targets.size)revealCoarse(coarse);
+          else for(const parentKey of coarse.parentKeys){const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=false}
         }
+        for(const group of coverageGroups.values()){
+          if(groupCovered(group)&&(!group.coarse||group.coarse.revealed))revealGroup(group);
+          else if(!group.revealed)for(const parentKey of group.parentKeys){const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=false}
+        }
+        markCoverage=(targetId,key)=>{
+          const group=targetGroups.get(targetId);if(!group)return;
+          group.ready.add(targetId);group.current.set(targetId,key);
+          const coarse=targetCoarseGroups.get(targetId);if(coarse)coarse.ready.add(targetId);
+          if(group.revealed){const entry=pixelTileLayer.tiles.get(key);if(entry)entry.hidden=false;return}
+          if(coarse&&!coarse.revealed){
+            if(coarse.ready.size!==coarse.targets.size)return;
+            revealCoarse(coarse);
+          }else if(groupCovered(group))revealGroup(group);
+          if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
+        };
       }
-      const markCoverage=(targetId,key)=>{
-        const group=targetGroups.get(targetId);if(!group)return;
-        group.ready.add(targetId);group.current.set(targetId,key);
-        if(group.revealed){const entry=pixelTileLayer.tiles.get(key);if(entry)entry.hidden=false;return}
-        if(group.ready.size!==group.targets.size)return;
-        for(const parentKey of group.parentKeys){const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=true}
-        for(const childKey of group.current.values()){const entry=pixelTileLayer.tiles.get(childKey);if(entry)entry.hidden=false}
-        group.revealed=true;
-        if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
-      };
       const keep=new Set();
       for(const {x,y} of targets){
         keep.add(tileURL(version,z,x,y));
