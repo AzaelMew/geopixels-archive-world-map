@@ -32,7 +32,7 @@
     const tileUsage=new Map();
     const missingTiles=new Set();
     const inFlightTiles=new Map();
-    let usageTick=0,moveRefreshTimer=0;
+    let usageTick=0,moveRefreshTimer=0,retryTimer=0;
     const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:true,dragRotate:false,style:'/map-style.json'});
     map.addControl(new maplibregl.NavigationControl());
     const credit=document.createElement('div');credit.id='credit';credit.className='maplibregl-ctrl';credit.textContent=`By Azael - V${appVersion}`;
@@ -114,7 +114,16 @@
             version===archiveVersion&&coarseSignature===viewportSignature(coarseZ)&&refreshTiles(coarseZ,true)):
           lastViewportSignature===coarseSignature&&displayedLevel===coarseZ?Promise.resolve(true):refreshTiles(coarseZ,true);
         Promise.resolve(coarse).then(complete=>{
-          if(!complete||version!==archiveVersion||coarseSignature!==viewportSignature(coarseZ))return;
+          // ponytail: an incomplete native settle (transient failure) retries
+          // itself instead of waiting for a gesture; any signature/version/
+          // zoom drift inside the retry re-check kills it. 204s and empty
+          // regions complete, so they never enter this path. Completed coarse
+          // settles still fall through to the split detail pass below.
+          if(!complete){
+            if(version===archiveVersion&&coarseSignature===viewportSignature(coarseZ)&&coarseZ===maxDataZoom&&map.getZoom()>=nativeZoomThreshold)scheduleNativeRetry(coarseZ);
+            return;
+          }
+          if(version!==archiveVersion||coarseSignature!==viewportSignature(coarseZ))return;
           const detailZ=settledDataLevel();
           if(detailZ!==coarseZ)refreshTiles(detailZ,false);
         });
@@ -127,6 +136,31 @@
         if(signature===lastViewportSignature)return;
         refreshTiles(z,z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold);
       },moveRefreshDelayMs);
+    }
+
+    // Bounded automatic retry for incomplete native (z13) settles.
+    const nativeRetryMaxAttempts=3,nativeRetryDelayMs=2000;
+    let nativeRetryAttempt=0;
+    function cancelNativeRetry(){if(retryTimer){clearTimeout(retryTimer);retryTimer=0}}
+    function scheduleNativeRetry(detailZ){
+      cancelNativeRetry();
+      if(lastViewportSignature===viewportSignature(detailZ)){nativeRetryAttempt=0;return} // completed
+      if(detailZ!==maxDataZoom||map.getZoom()<nativeZoomThreshold)return;
+      if(nativeRetryAttempt>=nativeRetryMaxAttempts)return;
+      const generation=refreshGeneration,version=archiveVersion,signature=viewportSignature(detailZ);
+      retryTimer=setTimeout(async()=>{
+        retryTimer=0;
+        // ponytail: in-flight sharing + supersede-by-signature make a redundant
+        // call cheap — it dedupes against activeRefresh or no-ops on completion.
+        if(generation!==refreshGeneration||version!==archiveVersion)return;
+        if(map.getZoom()<nativeZoomThreshold)return;
+        if(signature!==viewportSignature(detailZ))return;
+        const complete=await refreshTiles(detailZ,false);
+        if(!complete&&generation!==refreshGeneration)return;
+        if(complete){nativeRetryAttempt=0;return}
+        nativeRetryAttempt++;
+        scheduleNativeRetry(detailZ);
+      },nativeRetryDelayMs*Math.pow(2,nativeRetryAttempt));
     }
 
     const tileURL=(version,z,x,y)=>`/tiles/${version}/${z}/${x}/${y}.png?optional=1`;
@@ -212,6 +246,7 @@
       refreshGeneration++;
       for(const request of inFlightTiles.values())request.controller.abort();
       inFlightTiles.clear();activeRefresh=null;
+      cancelNativeRetry();nativeRetryAttempt=0;
       if(moveRefreshTimer){clearTimeout(moveRefreshTimer);moveRefreshTimer=0}
       if(pixelTileLayer)pixelTileLayer.clear();
       tileUsage.clear();usageTick=0;displayedLevel=null;lastViewportSignature='';
@@ -255,6 +290,8 @@
         if(generation!==refreshGeneration){closeFallbackResult(result);return false}
         pixelTileLayer.setTile(result.tile.key,result.tile.bitmap,result.tile.corners);
         closeBitmap(result.tile.bitmap);
+        // Upload consumed the bitmap — null it so later cleanup can't double-close.
+        result.tile.bitmap=null;
         if(pixelTileLayer.hasTile(result.tile.key))touchLoadedTile(result.tile.key,visible,stage);
         if(coverageReady)coverageReady(result.tile.key);
         return true;
@@ -276,7 +313,14 @@
         removeFallback();if(coverageReady)coverageReady(key);return true;
       };
       const closeBitmap=bitmap=>{if(bitmap&&typeof bitmap.close==='function')bitmap.close()};
-      const closeFallbackResult=result=>{if(result&&result.tile&&result.tile.key!==fallbackKey)closeBitmap(result.tile.bitmap)};
+      // ponytail: ownership via consumption — applyFallback nulls the bitmap after
+      // upload, so closeFallbackResult closes anything still holding one (fresh
+      // discarded fallbacks included) and never double-closes uploaded tiles.
+      const closeFallbackResult=result=>{
+        if(!result||!result.tile)return;
+        if(result.tile.key===fallbackKey&&pixelTileLayer.hasTile(fallbackKey))return; // live reused/retained fallback tile, not a fresh bitmap
+        closeBitmap(result.tile.bitmap);result.tile.bitmap=null;
+      };
       const first=await Promise.race([detailPromise,fallbackPromise]);
       if(generation!==refreshGeneration){
         if(first.kind==='fallback'){
@@ -295,7 +339,16 @@
         // ponytail: never report a failed native tile as done just because z12 covered it;
         // recording completion would suppress all retries of that tile.
         const failedNative=first.error&&z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold;
-        if(failedNative)return false;
+        if(failedNative){
+          // ponytail: native failure must not cancel its z12 fallback — the
+          // delayed fallback result becomes visible coverage (kept retriable),
+          // and the refresh stays incomplete so a later attempt can retry.
+          if(reusedFallback)return false;
+          background.push(fallbackPromise.then(result=>{
+            if(generation===refreshGeneration)applyFallback(result);else closeFallbackResult(result);
+          }));
+          return false;
+        }
         if(reusedFallback)return true;
         // ponytail: intentional 204 with no fallback either (204 all the way up)
         // means the cell is genuinely empty — count it done instead of blocking
@@ -397,6 +450,10 @@
       const complete=results.every(Boolean);
       if(!complete&&stage)return false;
       if(complete){
+        // ponytail: below the native threshold a completed coarse refresh hides
+        // (but keeps cached) higher-level native tiles so they stop costing GPU
+        // draw calls under the coarser coverage; zooming back reuses them.
+        const hideNatives=!progressiveNative&&z<maxDataZoom;
         // ponytail: sweep hides/removes only entries at or below this refresh's
         // level; already-native higher-level coverage survives coarse settles.
         // settledCoverage spares already-revealed children/retained fallbacks of
@@ -405,6 +462,7 @@
         for(const [key,entry] of pixelTileLayer.tiles){
           const seg=key.startsWith('fallback/')?key.slice('fallback/'.length):key;
           const level=Number(seg.split('/')[1]);
+          if(hideNatives&&level>z&&!visible.has(key)){entry.hidden=true;continue}
           if(level>z&&!visible.has(key))continue;
           if(settledCoverage.has(key)||visible.has(key)){entry.hidden=false;continue}
           if(key.startsWith('fallback/')&&level<=z){pixelTileLayer.removeTile(key);tileUsage.delete(key);continue}

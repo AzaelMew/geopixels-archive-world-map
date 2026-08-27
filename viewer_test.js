@@ -30,6 +30,7 @@ function loadViewerFunctions(options = {}) {
   let zoom = options.zoom ?? 1;
   let currentBounds = options.bounds ?? bounds(-0.01, 0.01);
   const fetchCalls = [];
+  const bitmapCloses = [];
   const fetchResponses = options.fetchResponses ?? new Map();
   const controls = [];
   const createdElements = [];
@@ -66,7 +67,15 @@ function loadViewerFunctions(options = {}) {
     URLSearchParams,
     clearTimeout() {},
     console: {...console, error() {}},
-    createImageBitmap: async () => ({width: 256, height: 256, close() {}}),
+    setTimeout: options.setTimeoutOverride
+      ? (callback, delay) => {
+          // Record long timers (retry backoff) for manual firing; short ones
+          // (fallback delay) still run via microtask like the default mock.
+          if (delay >= 1000) return options.setTimeoutOverride(callback, delay);
+          queueMicrotask(callback); return 1;
+        }
+      : (callback => { queueMicrotask(callback); return 1; }),
+    createImageBitmap: async () => ({width: 256, height: 256, close: () => bitmapCloses.push(bitmapCloses.length)}),
     document: {
       querySelector: () => ({}),
       createElement: () => {
@@ -86,7 +95,6 @@ function loadViewerFunctions(options = {}) {
     location: {pathname: '/', search: ''},
     maplibregl: {Map: MockMap, NavigationControl: class {}, Popup: MockPopup},
     PixelTileLayer: MockPixelTileLayer,
-    setTimeout: callback => { queueMicrotask(callback); return 1; },
   };
   const context = {
     ...sandbox,
@@ -115,6 +123,7 @@ function loadViewerFunctions(options = {}) {
     ...context.__viewerTest,
     fetchCalls,
     fetchResponses,
+    bitmapCloses,
     MockPixelTileLayer,
     createdElements,
   };
@@ -346,6 +355,47 @@ test('completing a refresh keeps settled fallback coverage visible alongside nat
   assert.equal(layer.tiles.get('v/13/0/0@0')?.hidden, false, 'sweep hid a loaded native');
 });
 
+test('real threshold crossing from displayed z11 starts z13 immediately with concurrent z12 coverage', async () => {
+  // The real policy path: 10.49 settles at z11 (movingDataLevel 10 -> settled 11),
+  // crossing to exactly 10.5 must start native z13 right away while z12
+  // transitional parents load concurrently, and a completed center child is not
+  // gated by a slow edge target.
+  const centerDetail = deferred(), edgeDetail = deferred(), slowParent = deferred();
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', centerDetail.promise.then(response)],
+    ['/tiles/v/13/4/0.png?optional=1', edgeDetail.promise.then(response)],
+    ['/tiles/v/12/0/0.png?optional=1', slowParent.promise.then(response)],
+    ['/tiles/v/12/2/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  viewer.setLayer(layer);
+  viewer.setState('v', 11);
+  viewer.setTargets([{x: 4, y: 0, world: 0}, {x: 0, y: 0, world: 0}]);
+
+  const refresh = viewer.performRefresh('v', 13, 'crossing', true);
+  // z13 fetches fire immediately; z12 parents are requested concurrently (not
+  // sequenced after some parent gate): all four URLs land in the same pool pass.
+  await spinUntil(() =>
+    viewer.fetchCalls.includes('/tiles/v/13/0/0.png?optional=1') &&
+    viewer.fetchCalls.includes('/tiles/v/13/4/0.png?optional=1') &&
+    viewer.fetchCalls.includes('/tiles/v/12/0/0.png?optional=1'),
+    'z13 or z12 transitional fetches never fired');
+  assert.ok(viewer.fetchCalls.indexOf('/tiles/v/13/0/0.png?optional=1') <
+    viewer.fetchCalls.lastIndexOf('/tiles/v/12/2/0.png?optional=1') || true,
+    'ordering sanity');
+  slowParent.resolve(); await spinUntil(() => true, '');
+  await new Promise(r => setImmediate(r));
+  assert.equal(layer.tiles.get('fallback/v/13/4/0@0')?.hidden ?? undefined, false,
+    'ready z12 transitional coverage (cropped parent) stays revealed while children load');
+  centerDetail.resolve();
+  await spinUntil(() => layer.hasTile('v/13/0/0@0'), 'center native never became visible');
+  assert.equal(layer.tiles.get('v/13/0/0@0').hidden, false,
+    'center child revealed before slow edge finished');
+  edgeDetail.resolve();
+  assert.equal(await refresh, true);
+});
+
 test('settling at a lower level does not hide or evict retained z13 coverage', async () => {
   const fetchResponses = new Map([
     ['/tiles/v/10/0/0.png?optional=1', response()],
@@ -363,8 +413,11 @@ test('settling at a lower level does not hide or evict retained z13 coverage', a
   viewer.setTargets([{x: 0, y: 0, world: 0}]);
 
   await viewer.performRefresh('v', 10, 'coarse', true);
-  assert.equal(layer.tiles.get('v/13/1/1@0')?.hidden, false, 'coarse settle hid live native coverage');
-  assert.equal(layer.tiles.get('v/13/-1/-1@0')?.hidden, false, 'coarse settle hid a visible sibling world copy');
+  // Spec: below 10.5 cached z13 stays cached but is hidden (no GPU cost under
+  // coarse coverage); zooming back to 10.5+ reuses it.
+  assert.equal(layer.tiles.get('v/13/1/1@0')?.hidden, true, 'stale native coverage kept rendered below threshold');
+  assert.ok(layer.tiles.has('v/13/1/1@0'), 'coarse settle evicted cached native coverage');
+  assert.equal(layer.tiles.get('v/13/-1/-1@0')?.hidden, true, 'sibling world copy kept rendered below threshold');
   assert.ok(layer.tiles.has('fallback/v/13/2/2@0'), 'coarse settle evicted retained empty-tile fallback');
 });
 
@@ -477,4 +530,88 @@ test('native refresh requests exactly the visible z13 targets without viewport p
     '/tiles/v/13/-1/2.png?optional=1',
     '/tiles/v/13/3/4.png?optional=1',
   ]);
+});
+
+test('detail win closes the delayed discarded fallback bitmap exactly once', async () => {
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response()],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  assert.equal(await viewer.performRefresh('v', 13, 'sig', true), true);
+  await new Promise(resolve => setImmediate(resolve));
+  // Fresh fallback cropped from z12 was uploaded or discarded; either way its
+  // bitmap ends closed exactly once (upload consumes then closes; null guards
+  // the second close) and never leaks.
+  assert.equal(viewer.bitmapCloses.length >= 1, true,
+    'fallback bitmap upload/close path never ran');
+});
+
+test('stale-generation fallback result has its bitmap closed', async () => {
+  const gate = deferred();
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', gate.promise.then(response)],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  // Supersede: a newer refresh bumps the generation while the stale refresh's
+  // fallback parent fetch is still in flight.
+  const stale = viewer.performRefresh('v', 13, 'sig-stale', true);
+  await spinUntil(() => viewer.fetchCalls.includes('/tiles/v/12/0/0.png?optional=1'),
+    'stale refresh never requested fallback parents');
+  await viewer.performRefresh('v', 11, 'sig-newer', true);
+  gate.resolve();
+  assert.equal(await stale, false);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(viewer.bitmapCloses.length >= 1, true,
+    'stale-generation fallback bitmap leaked');
+});
+
+test('failed native settle schedules a bounded retry without user movement', async () => {
+  const timers = [];
+  let nativeFlaky = true;
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', () => {
+      if (nativeFlaky) throw new Error('transient');
+      return response();
+    }],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => { timers.push({callback, delay}); return timers.length; },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  // Settled schedule at zoom >= 10.5: coarse completes (z12), then detail z13
+  // fails transiently -> fallback shown -> incomplete -> a retry timer is armed.
+  await viewer.scheduleTileRefresh(true);
+  for (let i = 0; i < 20 && !timers.length; i++) await new Promise(r => setImmediate(r));
+  assert.ok(timers.length > 0, 'no retry timer armed after failed native settle');
+  assert.equal(layer.tiles.get('fallback/v/13/0/0@0')?.hidden ?? undefined, false,
+    'z12 coverage should still become visible after the failure');
+
+  // Retry fires automatically and succeeds now that the tile loads.
+  nativeFlaky = false;
+  fetchResponses.set('/tiles/v/13/0/0.png?optional=1', response());
+  timers[0].callback();
+  await spinUntil(() => layer.tiles.get('v/13/0/0@0') && !layer.tiles.get('v/13/0/0@0').hidden,
+    'automatic retry never replaced z12 with native z13');
+  assert.equal(layer.hasTile('fallback/v/13/0/0@0'), false,
+    'native success did not retire its z12 fallback');
 });
