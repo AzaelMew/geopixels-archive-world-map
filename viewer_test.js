@@ -882,6 +882,171 @@ test('genuinely empty 204 cell counts as replacement coverage next to a failing 
     'retry success did not settle the viewport at z13');
 });
 
+test('transient parent errors after native 204 do not count as genuine empty coverage', async () => {
+  const timers = [];
+  let parentsFlaky = true;
+
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response(204)],
+
+    ['/tiles/v/12/0/0.png?optional=1', () => {
+      if (parentsFlaky) throw new Error('z12 transient failure');
+      return response();
+    }],
+
+    ['/tiles/v/11/0/0.png?optional=1', () => {
+      if (parentsFlaky) throw new Error('z11 transient failure');
+      return response();
+    }],
+  ]);
+
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => {
+      if (delay >= 1000) {
+        timers.push({callback, delay});
+        return timers.length;
+      }
+      queueMicrotask(callback);
+      return 1;
+    },
+  });
+
+  const layer = new viewer.MockPixelTileLayer();
+
+  // Existing coarse coverage must remain visible while parent lookup is unknown.
+  layer.tiles.set('v/11/0/0@0', {hidden: false});
+
+  viewer.setLayer(layer);
+  viewer.setState('v', 11);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.scheduleTileRefresh(true);
+
+  await spinUntil(
+    () => timers.length === 1,
+    'transient parent failures did not leave the native refresh incomplete'
+  );
+
+  // z13 was genuinely absent, but both fallback lookups failed transiently.
+  // That must NOT be interpreted as transparent/genuinely-empty coverage.
+  assert.equal(
+    layer.tiles.get('v/11/0/0@0')?.hidden,
+    false,
+    'coarse parent was retired after transient parent lookup errors'
+  );
+
+  assert.equal(
+    layer.hasTile('fallback/v/13/0/0@0'),
+    false,
+    'fallback unexpectedly appeared while both parent lookups were failing'
+  );
+
+  assert.equal(
+    timers[0].delay,
+    2000,
+    'transient parent lookup failure should arm the normal 2s native retry'
+  );
+
+  // Parent service recovers. The existing retry should re-run fallback lookup.
+  parentsFlaky = false;
+  timers.shift().callback();
+
+  await spinUntil(
+    () => layer.tiles.get('fallback/v/13/0/0@0')?.hidden === false,
+    'recovered parent lookup did not produce fallback coverage'
+  );
+
+  await spinUntil(
+    () => viewer.getState().displayedLevel === 13,
+    'recovered parent coverage did not allow the viewport to settle'
+  );
+
+  assert.equal(
+    layer.tiles.get('v/11/0/0@0')?.hidden,
+    true,
+    'coarse parent remained visible after valid replacement coverage arrived'
+  );
+
+  assert.equal(timers.length, 0, 'retry remained armed after recovery');
+});
+
+test('superseded native-204 fallback lookup cannot retire coarse coverage', async () => {
+  const fallbackGate = deferred();
+
+  const fetchResponses = new Map([
+    // First/stale viewport:
+    ['/tiles/v/13/0/0.png?optional=1', response(204)],
+    ['/tiles/v/12/0/0.png?optional=1', fallbackGate.promise],
+
+    // Superseding viewport:
+    ['/tiles/v/13/4/0.png?optional=1', response()],
+  ]);
+
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+  });
+
+  const layer = new viewer.MockPixelTileLayer();
+
+  // Coarse tile belonging to the first refresh.
+  layer.tiles.set('v/11/0/0@0', {hidden: false});
+
+  viewer.setLayer(layer);
+  viewer.setState('v', 11);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  // Start the refresh that will become stale.
+  const stale = viewer.performRefresh(
+    'v',
+    13,
+    'stale-native-204',
+    true
+  );
+
+  await spinUntil(
+    () => viewer.fetchCalls.includes('/tiles/v/12/0/0.png?optional=1'),
+    'stale refresh never entered its parent fallback lookup'
+  );
+
+  // Start a real second refresh. performRefresh increments refreshGeneration,
+  // making the first refresh stale.
+  viewer.setTargets([{x: 4, y: 0, world: 0}]);
+
+  const current = viewer.performRefresh(
+    'v',
+    13,
+    'superseding-refresh',
+    true
+  );
+
+  await spinUntil(
+    () => viewer.fetchCalls.includes('/tiles/v/13/4/0.png?optional=1'),
+    'superseding refresh never started'
+  );
+
+  // Only now allow the old fallback lookup to finish.
+  fallbackGate.resolve(response());
+
+  assert.equal(
+    await stale,
+    false,
+    'superseded refresh incorrectly reported completion'
+  );
+
+  // The stale refresh must not use its late result to mark transparent
+  // replacement coverage or retire its original z11 parent.
+  assert.equal(
+    layer.tiles.get('v/11/0/0@0')?.hidden,
+    false,
+    'stale refresh retired coarse coverage after being superseded'
+  );
+
+  await current;
+});
+
 test('new viewport receives a fresh retry budget after the old one is exhausted', async () => {
   const timers = [];
   let oldCalls = 0, newCalls = 0, newFlaky = true;

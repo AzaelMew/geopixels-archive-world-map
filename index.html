@@ -210,7 +210,7 @@
       });
     }
 
-    async function loadFallbackForTile(version,z,x,y,world,generation,fetches){
+    async function loadFallbackForTile(version,z,x,y,world,generation,fetches,fallbackStatus){
       for(let delta=1;delta<=2&&z-delta>=0;delta++){
         const scale=Math.pow(2,delta),parentZ=z-delta,parentX=Math.floor(x/scale),parentY=Math.floor(y/scale);
         try{
@@ -223,6 +223,7 @@
         }catch(error){
           if(error.name!=='AbortError')console.error(error);
           if(generation!==refreshGeneration)return null;
+          fallbackStatus.hadError=true;
         }
       }
       return null;
@@ -269,6 +270,7 @@
       const reusedFallback=touchLoadedTile(fallbackKey,visible,stage);
       if(reusedFallback&&coverageReady)coverageReady(fallbackKey);
       let suppressFallback=false;
+      const fallbackStatus={hadError:false};
       const detailPromise=fetchTileBlob(version,z,x,y,fetches)
         .then(async blob=>{
           if(generation!==refreshGeneration)return {kind:'detail',stale:true}
@@ -284,7 +286,7 @@
         .catch(error=>{if(error.name!=='AbortError')console.error(error);return {kind:'detail',error}});
       const fallbackPromise=(reusedFallback||!allowFallback?Promise.resolve(null):
         new Promise(resolve=>setTimeout(resolve,fallbackDelayMs))
-          .then(()=>suppressFallback||generation!==refreshGeneration?null:loadFallbackForTile(version,z,x,y,world,generation,fetches)))
+          .then(()=>suppressFallback||generation!==refreshGeneration?null:loadFallbackForTile(version,z,x,y,world,generation,fetches,fallbackStatus)))
         .then(tile=>({kind:'fallback',tile}));
       const removeFallback=()=>{
         if(pixelTileLayer.hasTile(fallbackKey))pixelTileLayer.removeTile(fallbackKey);
@@ -360,13 +362,20 @@
         // means the cell is genuinely empty — count it done instead of blocking
         // completion forever; refreshes then sweep leftovers instead of restaging.
         const fbResult=await fallbackPromise;
-        if(!fbResult?.tile&&first.blob===null&&retainMissingFallback&&!pixelTileLayer.hasTile(fallbackKey)){
-          // Genuinely empty (204 up the chain) = transparent replacement
-          // coverage; the z11 retirement guard must count it or old coarse
-          // stays visible next to a still-failing sibling forever.
+
+        if(generation!==refreshGeneration)return false;
+
+        if(
+          !fbResult?.tile &&
+          first.blob===null &&
+          retainMissingFallback &&
+          !pixelTileLayer.hasTile(fallbackKey) &&
+          !fallbackStatus.hadError
+        ){
           if(coverageReady)coverageReady(null);
           return true;
         }
+
         return applyFallback(fbResult);
       }
       // ponytail: never report a failed native tile as done just because z12 covered it;
