@@ -140,23 +140,25 @@
 
     // Bounded automatic retry for incomplete native (z13) settles.
     const nativeRetryMaxAttempts=3,nativeRetryDelayMs=2000;
-    let nativeRetryAttempt=0;
-    function cancelNativeRetry(){if(retryTimer){clearTimeout(retryTimer);retryTimer=0}}
+    let nativeRetryAttempt=0,nativeRetryEpoch=0;
+    function cancelNativeRetry(){if(retryTimer){clearTimeout(retryTimer);retryTimer=0}nativeRetryEpoch++}
     function scheduleNativeRetry(detailZ){
       cancelNativeRetry();
       if(lastViewportSignature===viewportSignature(detailZ)){nativeRetryAttempt=0;return} // completed
       if(detailZ!==maxDataZoom||map.getZoom()<nativeZoomThreshold)return;
       if(nativeRetryAttempt>=nativeRetryMaxAttempts)return;
-      const generation=refreshGeneration,version=archiveVersion,signature=viewportSignature(detailZ);
+      const epoch=nativeRetryEpoch,version=archiveVersion,signature=viewportSignature(detailZ);
       retryTimer=setTimeout(async()=>{
         retryTimer=0;
-        // ponytail: in-flight sharing + supersede-by-signature make a redundant
-        // call cheap — it dedupes against activeRefresh or no-ops on completion.
-        if(generation!==refreshGeneration||version!==archiveVersion)return;
+        // ponytail: retry identity is its own epoch, decoupled from
+        // refreshGeneration — the retry's own refresh bumps the generation by
+        // design and must not look like external invalidation. In-flight
+        // sharing + supersede-by-signature still dedupe redundant calls.
+        if(epoch!==nativeRetryEpoch||version!==archiveVersion)return;
         if(map.getZoom()<nativeZoomThreshold)return;
         if(signature!==viewportSignature(detailZ))return;
         const complete=await refreshTiles(detailZ,false);
-        if(!complete&&generation!==refreshGeneration)return;
+        if(epoch!==nativeRetryEpoch)return;
         if(complete){nativeRetryAttempt=0;return}
         nativeRetryAttempt++;
         scheduleNativeRetry(detailZ);
@@ -386,7 +388,11 @@
       const settledCoverage=new Set();
       const bounds=map.getBounds(),targets=prioritizeNativeTiles(visibleNativeTiles(bounds,z),z,bounds);
       const progressiveNative=z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold;
-      const transitionLevel=progressiveNative&&displayedLevel!==null&&displayedLevel<z?displayedLevel:null;
+      // ponytail: transitional groups use z12 (one level under the native
+      // target) instead of displayedLevel — a z11 parent spans 16 z13 children,
+      // so one slow child could withhold 15 ready siblings; z12 regions cap
+      // that blast radius at 4 while keeping parent-atomic reveal.
+      const transitionLevel=progressiveNative&&displayedLevel!==null&&displayedLevel<z?Math.min(displayedLevel,z-1):null;
       const stage=displayedLevel!==null&&displayedLevel!==z;
       const targetGroups=new Map(),coverageGroups=new Map();
       if(transitionLevel!==null){

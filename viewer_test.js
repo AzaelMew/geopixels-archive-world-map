@@ -31,6 +31,13 @@ function loadViewerFunctions(options = {}) {
   let currentBounds = options.bounds ?? bounds(-0.01, 0.01);
   const fetchCalls = [];
   const bitmapCloses = [];
+  let nextBitmapId = 1;
+  const bitmapCloseCounts = new Map();
+  const trackBitmap = async () => {
+    const id = nextBitmapId++;
+    return {id, width: 256, height: 256,
+      close() { bitmapCloseCounts.set(id, (bitmapCloseCounts.get(id) || 0) + 1); bitmapCloses.push(id); }};
+  };
   const fetchResponses = options.fetchResponses ?? new Map();
   const controls = [];
   const createdElements = [];
@@ -75,7 +82,7 @@ function loadViewerFunctions(options = {}) {
           queueMicrotask(callback); return 1;
         }
       : (callback => { queueMicrotask(callback); return 1; }),
-    createImageBitmap: async () => ({width: 256, height: 256, close: () => bitmapCloses.push(bitmapCloses.length)}),
+    createImageBitmap: options.createImageBitmap || trackBitmap,
     document: {
       querySelector: () => ({}),
       createElement: () => {
@@ -86,7 +93,8 @@ function loadViewerFunctions(options = {}) {
     },
     fetch: async url => {
       fetchCalls.push(url);
-      const value = fetchResponses.get(url);
+      let value = fetchResponses.get(url);
+      if (typeof value === 'function') value = value(); // dynamic stub support
       if (value instanceof Error) throw value;
       if (value?.then) return value;
       return value ?? response();
@@ -124,6 +132,7 @@ function loadViewerFunctions(options = {}) {
     fetchCalls,
     fetchResponses,
     bitmapCloses,
+    bitmapCloseCounts,
     MockPixelTileLayer,
     createdElements,
   };
@@ -381,9 +390,11 @@ test('real threshold crossing from displayed z11 starts z13 immediately with con
     viewer.fetchCalls.includes('/tiles/v/13/4/0.png?optional=1') &&
     viewer.fetchCalls.includes('/tiles/v/12/0/0.png?optional=1'),
     'z13 or z12 transitional fetches never fired');
+  // Real ordering assertion: the center z13 detail request must be issued
+  // before the far-edge z12 transitional parent (center-first, z13 not gated).
   assert.ok(viewer.fetchCalls.indexOf('/tiles/v/13/0/0.png?optional=1') <
-    viewer.fetchCalls.lastIndexOf('/tiles/v/12/2/0.png?optional=1') || true,
-    'ordering sanity');
+    viewer.fetchCalls.lastIndexOf('/tiles/v/12/2/0.png?optional=1'),
+    'z13 center request must precede edge z12 transitional fetch');
   slowParent.resolve(); await spinUntil(() => true, '');
   await new Promise(r => setImmediate(r));
   assert.equal(layer.tiles.get('fallback/v/13/4/0@0')?.hidden ?? undefined, false,
@@ -393,6 +404,48 @@ test('real threshold crossing from displayed z11 starts z13 immediately with con
   assert.equal(layer.tiles.get('v/13/0/0@0').hidden, false,
     'center child revealed before slow edge finished');
   edgeDetail.resolve();
+  assert.equal(await refresh, true);
+});
+
+test('slow sibling in the SAME z11 parent does not delay ready native center', async () => {
+  // z11 -> z13: scale = 2^(13-11) = 4, so x=0 AND x=1 both sit in z11 parent 0.
+  // One lagging child inside that parent must not hold back its finished sibling.
+  const fastDetail = deferred(), slowSibling = deferred(), sameParent12 = deferred();
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', fastDetail.promise.then(response)],
+    ['/tiles/v/13/1/0.png?optional=1', slowSibling.promise.then(response)],
+    ['/tiles/v/12/0/0.png?optional=1', sameParent12.promise.then(response)],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  viewer.setLayer(layer);
+  viewer.setState('v', 11);
+  viewer.setTargets([{x: 1, y: 0, world: 0}, {x: 0, y: 0, world: 0}]);
+
+  const refresh = viewer.performRefresh('v', 13, 'crossing-same-parent', true);
+  await spinUntil(() =>
+    viewer.fetchCalls.includes('/tiles/v/13/0/0.png?optional=1') &&
+    viewer.fetchCalls.includes('/tiles/v/13/1/0.png?optional=1') &&
+    viewer.fetchCalls.includes('/tiles/v/12/0/0.png?optional=1'),
+    'z13/z12 fetches for the shared parent never fired');
+
+  // Shared z12 transitional parent arrives first: it covers both children.
+  sameParent12.resolve();
+  await new Promise(r => setImmediate(r));
+  assert.equal(layer.tiles.get('fallback/v/13/1/0@0')?.hidden ?? undefined, false,
+    'z12 transitional crop should cover the pending sibling region');
+
+  // Fast center child finishes while the sibling is still loading: its native
+  // quad must be revealed immediately — a pending sibling inside the SAME
+  // z11 parent (16-child group under old grouping) must not withhold it.
+  fastDetail.resolve();
+  await spinUntil(() => layer.hasTile('v/13/0/0@0'),
+    'ready native child inside a partially-covered group was withheld');
+  assert.equal(layer.tiles.get('v/13/0/0@0').hidden, false,
+    'native child hidden behind unfinished siblings in the same z11 parent');
+
+  slowSibling.resolve();
+  await spinUntil(() => layer.hasTile('v/13/1/0@0'), 'sibling native never revealed');
   assert.equal(await refresh, true);
 });
 
@@ -545,11 +598,12 @@ test('detail win closes the delayed discarded fallback bitmap exactly once', asy
 
   assert.equal(await viewer.performRefresh('v', 13, 'sig', true), true);
   await new Promise(resolve => setImmediate(resolve));
-  // Fresh fallback cropped from z12 was uploaded or discarded; either way its
-  // bitmap ends closed exactly once (upload consumes then closes; null guards
-  // the second close) and never leaks.
-  assert.equal(viewer.bitmapCloses.length >= 1, true,
-    'fallback bitmap upload/close path never ran');
+  // Every bitmap that was created got closed exactly once (uploaded fallback
+  // bitmaps are consumed-then-closed; no leaks, no double closes).
+  assert.ok(viewer.bitmapCloseCounts.size >= 1, 'no bitmap ownership path ran');
+  for (const [id, count] of viewer.bitmapCloseCounts) {
+    assert.equal(count, 1, `bitmap #${id} closed ${count} times`);
+  }
 });
 
 test('stale-generation fallback result has its bitmap closed', async () => {
@@ -573,8 +627,40 @@ test('stale-generation fallback result has its bitmap closed', async () => {
   gate.resolve();
   assert.equal(await stale, false);
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(viewer.bitmapCloses.length >= 1, true,
-    'stale-generation fallback bitmap leaked');
+  // Every created bitmap (stale fallback crops etc.) ended closed exactly once
+  // — the superseded refresh's fallback bitmaps all leak-proof.
+  assert.ok(viewer.bitmapCloseCounts.size >= 1, 'no bitmap ownership path ran');
+  for (const [id, count] of viewer.bitmapCloseCounts) {
+    assert.equal(count, 1, `bitmap #${id} closed ${count} times`);
+  }
+});
+
+test('applied fallback is uploaded then closed exactly once, reused fallback never closed', async () => {
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response(204)], // detail intentionally absent
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('fallback/v/13/0/0@0', {hidden: false}); // cached/reused fallback entry
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  assert.equal(await viewer.performRefresh('v', 13, 'sig', true), true);
+  await new Promise(resolve => setImmediate(resolve));
+  if (viewer.bitmapCloseCounts.size > 0) {
+    // A fresh bitmap was built and applied: uploaded then closed exactly once.
+    for (const [id, count] of viewer.bitmapCloseCounts) {
+      assert.equal(count, 1, `applied-fallback bitmap #${id} closed ${count} times`);
+    }
+  }
+  // The pre-existing (reused) cache entry must never be "closed" or evicted as
+  // though it owned a fresh bitmap — it stays resident and visible.
+  assert.equal(layer.hasTile('fallback/v/13/0/0@0'), true,
+    'reused cached fallback entry was discarded');
+  assert.equal(layer.tiles.get('fallback/v/13/0/0@0')?.hidden ?? undefined, false,
+    'reused cached fallback entry no longer visible');
 });
 
 test('failed native settle schedules a bounded retry without user movement', async () => {
@@ -590,7 +676,7 @@ test('failed native settle schedules a bounded retry without user movement', asy
   const viewer = loadViewerFunctions({
     zoom: 10.6,
     fetchResponses,
-    setTimeoutOverride: (callback, delay) => { timers.push({callback, delay}); return timers.length; },
+    setTimeoutOverride: (callback, delay) => { if (delay >= 1000) { timers.push({callback, delay}); return timers.length; } queueMicrotask(callback); return 1; },
   });
   const layer = new viewer.MockPixelTileLayer();
   layer.tiles.set('v/12/0/0@0', {hidden: false});
@@ -614,4 +700,180 @@ test('failed native settle schedules a bounded retry without user movement', asy
     'automatic retry never replaced z12 with native z13');
   assert.equal(layer.hasTile('fallback/v/13/0/0@0'), false,
     'native success did not retire its z12 fallback');
+});
+
+test('retry state machine: full backoff sequence then success', async () => {
+  const timers = [];
+  let attempts = 0;
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', () => {
+      attempts++;
+      if (attempts < 4) throw new Error(`transient ${attempts}`);
+      return response();
+    }],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => { if (delay >= 1000) { timers.push({callback, delay}); return timers.length; } queueMicrotask(callback); return 1; },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.scheduleTileRefresh(true);
+  for (let i = 0; i < 20 && !timers.length; i++) await new Promise(r => setImmediate(r));
+  assert.equal(layer.hasTile('fallback/v/13/0/0@0'), true,
+    'initial failure did not show z12 coverage');
+
+  // Fail retries #1..#3 (delays 2000/4000/8000), success on the last one.
+  for (const expected of [2000, 4000, 8000]) {
+    assert.equal(timers[0].delay, expected,
+      `expected ${expected}ms backoff before this retry`);
+    timers.shift().callback();
+    for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+    if (expected !== 8000) assert.ok(timers.length > 0, `no retry armed after attempt with backoff ${expected}`);
+  }
+  await spinUntil(() => layer.tiles.get('v/13/0/0@0') && !layer.tiles.get('v/13/0/0@0').hidden,
+    'final retry never revealed native z13');
+  assert.equal(attempts, 4, 'unexpected total native attempt count');
+});
+
+test('retry state machine: stops after max attempts, no infinite loop', async () => {
+  const timers = [];
+  let fired = 0;
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', () => { throw new Error('always down'); }],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => { if (++fired <= 3) { timers.push({callback, delay}); return timers.length; } return ++fired; },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.scheduleTileRefresh(true);
+  for (let i = 0; i < 20 && !timers.length; i++) await new Promise(r => setImmediate(r));
+  // Drain all scheduled retries: after 3 failed attempts no more may arm.
+  while (timers.length) {
+    const t = timers.shift();
+    t.callback();
+    for (let i = 0; i < 40 && !timers.length; i++) await new Promise(r => setImmediate(r));
+  }
+  assert.ok(fired <= 4, `retry loop not bounded: ${fired - 1} auto retries`);
+  assert.equal(layer.hasTile('fallback/v/13/0/0@0'), true,
+    'z12 fallback lost during exhausted retries');
+});
+
+test('viewport change invalidates the pending retry', async () => {
+  const timers = [];
+  let detailCalls = 0;
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', () => { detailCalls++; throw new Error('down'); }],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => { if (delay >= 1000) { timers.push({callback, delay}); return timers.length; } queueMicrotask(callback); return 1; },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.scheduleTileRefresh(true);
+  for (let i = 0; i < 20 && !timers.length; i++) await new Promise(r => setImmediate(r));
+  assert.ok(timers.length > 0, 'retry never armed');
+
+  // Move elsewhere: superseding move changes signature + bumps generation.
+  viewer.setTargets([{x: 5, y: 5, world: 1}]);
+  timers[0].callback();
+  for (let i = 0; i < 10; i++) await new Promise(r => setImmediate(r));
+  assert.equal(detailCalls, 1, 'stale-viewport retry must not re-request natives');
+});
+
+test('archive version change invalidates the pending retry', async () => {
+  const timers = [];
+  let v13Calls = 0;
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', () => { v13Calls++; throw new Error('down'); }],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => { if (delay >= 1000) { timers.push({callback, delay}); return timers.length; } queueMicrotask(callback); return 1; },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.scheduleTileRefresh(true);
+  for (let i = 0; i < 20 && !timers.length; i++) await new Promise(r => setImmediate(r));
+
+  viewer.setState('w', 13); // archive version switch invalidates everything
+  timers[0].callback();
+  for (let i = 0; i < 10; i++) await new Promise(r => setImmediate(r));
+  assert.equal(v13Calls, 1, 'old-version retry must not fetch stale tiles');
+});
+
+test('zoom below threshold invalidates the pending retry', async () => {
+  const timers = [];
+  let v13Calls = 0;
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', () => { v13Calls++; throw new Error('down'); }],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => { if (delay >= 1000) { timers.push({callback, delay}); return timers.length; } queueMicrotask(callback); return 1; },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.scheduleTileRefresh(true);
+  for (let i = 0; i < 20 && !timers.length; i++) await new Promise(r => setImmediate(r));
+
+  viewer.setZoom(10.49);
+  timers[0].callback();
+  for (let i = 0; i < 10; i++) await new Promise(r => setImmediate(r));
+  assert.equal(v13Calls, 1, 'z13 retry ran below the native threshold');
+});
+
+test('intentional 204 native settle does not arm transient retries', async () => {
+  const timers = [];
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response(204)],
+    ['/tiles/v/12/0/0.png?optional=1', response(204)],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => { if (delay >= 1000) { timers.push({callback, delay}); return timers.length; } queueMicrotask(callback); return 1; },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.scheduleTileRefresh(true);
+  for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r));
+  assert.equal(timers.length, 0, 'all-empty region armed a transient retry');
 });
