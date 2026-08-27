@@ -20,6 +20,7 @@
   <script src="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
   <script src="/pixel-tile-layer.js"></script>
   <script>
+    const appVersion='1';
     const gridSize=25,tileSize=256,maxDataZoom=13,earthRadius=6378137,mercatorHalfWorld=Math.PI*earthRadius;
     const params=new URLSearchParams(location.search);
     const select=document.querySelector('#version'),status=document.querySelector('#status');
@@ -34,7 +35,7 @@
     let usageTick=0,moveRefreshTimer=0;
     const map=new maplibregl.Map({container:'map',center:[+(params.get('lng')||0),+(params.get('lat')||0)],zoom:+(params.get('zoom')||1),renderWorldCopies:true,dragRotate:false,style:'/map-style.json'});
     map.addControl(new maplibregl.NavigationControl());
-    const credit=document.createElement('div');credit.id='credit';credit.className='maplibregl-ctrl';credit.textContent='By Azael';
+    const credit=document.createElement('div');credit.id='credit';credit.className='maplibregl-ctrl';credit.textContent=`By Azael - V${appVersion}`;
     map.addControl({onAdd:()=>credit,onRemove:()=>credit.remove()},'bottom-left');
 
     const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
@@ -124,7 +125,7 @@
         moveRefreshTimer=0;
         const z=movingDataLevel(),signature=viewportSignature(z);
         if(signature===lastViewportSignature)return;
-        refreshTiles(z,false);
+        refreshTiles(z,z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold);
       },moveRefreshDelayMs);
     }
 
@@ -216,18 +217,21 @@
       tileUsage.clear();usageTick=0;displayedLevel=null;lastViewportSignature='';
     }
 
-    async function loadTargetTile(version,z,x,y,world,generation,fetches,visible,background,allowFallback,stage){
+    async function loadTargetTile(version,z,x,y,world,generation,fetches,visible,background,allowFallback,stage,coverageReady){
       const key=`${version}/${z}/${x}/${y}@${world}`,fallbackKey=`fallback/${version}/${z}/${x}/${y}@${world}`;
+      const retainMissingFallback=z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold;
       if(touchLoadedTile(key,visible,stage)){
         if(pixelTileLayer.hasTile(fallbackKey)){pixelTileLayer.removeTile(fallbackKey);tileUsage.delete(fallbackKey)}
+        if(coverageReady)coverageReady(key);
         return true;
       }
       const reusedFallback=touchLoadedTile(fallbackKey,visible,stage);
+      if(reusedFallback&&coverageReady)coverageReady(fallbackKey);
       let suppressFallback=false;
       const detailPromise=fetchTileBlob(version,z,x,y,fetches)
         .then(async blob=>{
           if(generation!==refreshGeneration)return {kind:'detail',stale:true}
-          if(blob===null){suppressFallback=true;return {kind:'detail',blob:null}}
+          if(blob===null){if(!retainMissingFallback)suppressFallback=true;return {kind:'detail',blob:null}}
           try{
             const bitmap=await createImageBitmap(blob,{imageOrientation:'flipY'});
             suppressFallback=true;return {kind:'detail',bitmap};
@@ -250,17 +254,18 @@
         if(generation!==refreshGeneration){result.tile.bitmap.close();return false}
         pixelTileLayer.setTile(result.tile.key,result.tile.bitmap,result.tile.corners);result.tile.bitmap.close();
         if(pixelTileLayer.hasTile(result.tile.key))touchLoadedTile(result.tile.key,visible,stage);
+        if(coverageReady)coverageReady(result.tile.key);
         return true;
       };
       const applyDetail=async result=>{
         if(!result||result.error)return false;
         if(generation!==refreshGeneration){if(result.bitmap)result.bitmap.close();return false}
-        if(result.blob===null){removeFallback();return true}
+        if(result.blob===null){if(retainMissingFallback)return false;removeFallback();return true}
         const bitmap=result.bitmap;
         if(!bitmap)return false;
         pixelTileLayer.setTile(key,bitmap,nativeTileCorners(z,x,y,world));bitmap.close();
         if(pixelTileLayer.hasTile(key))touchLoadedTile(key,visible,stage);
-        removeFallback();return true;
+        removeFallback();if(coverageReady)coverageReady(key);return true;
       };
       const first=await Promise.race([detailPromise,fallbackPromise]);
       if(generation!==refreshGeneration){
@@ -300,7 +305,42 @@
     async function performRefresh(version,z,signature,allowFallback){
       const generation=++refreshGeneration;
       const fetches=new Map(),visible=new Set(),background=[];
-      const bounds=map.getBounds(),targets=prioritizeNativeTiles(visibleNativeTiles(bounds,z),z,bounds),stage=displayedLevel!==null&&displayedLevel!==z;
+      const bounds=map.getBounds(),targets=prioritizeNativeTiles(visibleNativeTiles(bounds,z),z,bounds);
+      const progressiveNative=z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold;
+      const transitionLevel=progressiveNative&&displayedLevel!==null&&displayedLevel<z?displayedLevel:null;
+      const stage=displayedLevel!==null&&displayedLevel!==z;
+      const targetGroups=new Map(),coverageGroups=new Map();
+      if(transitionLevel!==null){
+        const scale=Math.pow(2,z-transitionLevel);
+        for(const {x,y,world} of targets){
+          const targetId=`${x}/${y}@${world}`;
+          const parentX=Math.floor(x/scale),parentY=Math.floor(y/scale);
+          const groupId=`${parentX}/${parentY}@${world}`;
+          let group=coverageGroups.get(groupId);
+          if(!group){
+            const parentKey=`${version}/${transitionLevel}/${parentX}/${parentY}@${world}`;
+            group={parentKeys:[parentKey,`fallback/${parentKey}`],targets:new Set(),ready:new Set(),current:new Map(),revealed:false};
+            coverageGroups.set(groupId,group);
+          }
+          group.targets.add(targetId);targetGroups.set(targetId,group);
+          for(const childKey of [`${version}/${z}/${x}/${y}@${world}`,`fallback/${version}/${z}/${x}/${y}@${world}`]){
+            const entry=pixelTileLayer.tiles.get(childKey);if(entry)entry.hidden=true;
+          }
+        }
+        for(const group of coverageGroups.values())for(const parentKey of group.parentKeys){
+          const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=false;
+        }
+      }
+      const markCoverage=(targetId,key)=>{
+        const group=targetGroups.get(targetId);if(!group)return;
+        group.ready.add(targetId);group.current.set(targetId,key);
+        if(group.revealed){const entry=pixelTileLayer.tiles.get(key);if(entry)entry.hidden=false;return}
+        if(group.ready.size!==group.targets.size)return;
+        for(const parentKey of group.parentKeys){const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=true}
+        for(const childKey of group.current.values()){const entry=pixelTileLayer.tiles.get(childKey);if(entry)entry.hidden=false}
+        group.revealed=true;
+        if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
+      };
       const keep=new Set();
       for(const {x,y} of targets){
         keep.add(tileURL(version,z,x,y));
@@ -312,7 +352,8 @@
       }
       abortObsoleteTileRequests(keep);
       const results=await runTilePool(targets,({x,y,world})=>generation===refreshGeneration&&
-        loadTargetTile(version,z,x,y,world,generation,fetches,visible,background,allowFallback,stage));
+        loadTargetTile(version,z,x,y,world,generation,fetches,visible,background,allowFallback,stage,
+          targetGroups.size?key=>markCoverage(`${x}/${y}@${world}`,key):null));
       if(version!==archiveVersion||generation!==refreshGeneration)return false;
       const complete=results.every(Boolean);
       if(!complete&&stage)return false;
