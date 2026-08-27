@@ -166,7 +166,7 @@ test('native z13 transition remains at actual MapLibre zoom 10.5', () => {
 
 test('rendered credit uses the centrally defined application version', () => {
   const {appVersion, creditText} = loadViewerFunctions();
-  assert.equal(appVersion, '1');
+  assert.equal(appVersion, '0.1.0');
   assert.equal(creditText, `By Azael - V${appVersion}`);
 });
 
@@ -247,6 +247,36 @@ test('native children replace each coarse parent atomically and independently', 
   assert.equal(layer.tiles.get('v/12/2/0@0').hidden, true);
 });
 
+test('moving before the transition finishes keeps revealed native regions native', async () => {
+  const edge = deferred();
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response()],
+    ['/tiles/v/13/1/0.png?optional=1', response()],
+    ['/tiles/v/13/4/0.png?optional=1', edge.promise],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/12/0/0@0', {hidden: false});
+  layer.tiles.set('v/12/2/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: 4, y: 0, world: 0}, {x: 1, y: 0, world: 0}, {x: 0, y: 0, world: 0}]);
+
+  const first = viewer.performRefresh('v', 13, 'sig1', false);
+  await spinUntil(() => layer.tiles.get('v/12/0/0@0')?.hidden === true, 'center parent never retired');
+
+  // User moves: a new refresh supersedes the unfinished one.
+  const second = viewer.performRefresh('v', 13, 'sig2', false);
+  assert.equal(layer.tiles.get('v/12/0/0@0').hidden, true, 'move reset a completed region back to fallback');
+  assert.equal(layer.tiles.get('v/13/0/0@0').hidden, false);
+  assert.equal(layer.tiles.get('v/13/1/0@0').hidden, false);
+
+  edge.resolve(response());
+  assert.equal(await second, true);
+  assert.equal(await first, false);
+  assert.equal(layer.tiles.get('v/12/0/0@0').hidden, true);
+});
+
 test('failed edge coverage leaves coarse coverage without hiding completed center native tiles', async () => {
   const fetchResponses = new Map([
     ['/tiles/v/13/0/0.png?optional=1', response()],
@@ -264,6 +294,78 @@ test('failed edge coverage leaves coarse coverage without hiding completed cente
   assert.equal(layer.tiles.get('v/13/0/0@0').hidden, false);
   assert.equal(layer.tiles.get('v/12/0/0@0').hidden, true);
   assert.equal(layer.tiles.get('v/12/2/0@0').hidden, false);
+});
+
+test('fast zoom out and back in during transition completes the native refresh', async () => {
+  // settled z13 region backed only by a retained fallback (native 204), then a
+  // coarse settle, then straight back in: the z13 settled refresh runs with
+  // allowFallback=false and must count the retained fallback complete instead
+  // of restaging forever.
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response(204)],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+    ['/tiles/v/10/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.6, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  viewer.setLayer(layer);
+  viewer.setState('v', 13);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  assert.equal(await viewer.performRefresh('v', 13, 'sig', true), true,
+    'initial native settle should complete via retained fallback');
+  assert.equal(layer.tiles.get('fallback/v/13/0/0@0')?.hidden, false,
+    'z12 fallback coverage visible for the intentional-missing native');
+  await viewer.performRefresh('v', 10, 'sig-coarse', true);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+  const result = await viewer.performRefresh('v', 13, 'sig-back', false);
+  assert.equal(result, true, 'returning to native after fast zoom out/in should complete');
+});
+
+test('completing a refresh keeps settled fallback coverage visible alongside natives', async () => {
+  // an intentional-missing target whose retained z12 fallback is already on
+  // screen, next to a native-loaded sibling; completing the refresh must keep
+  // the settled fallback visible instead of restaging the region.
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response()],
+    ['/tiles/v/13/1/0.png?optional=1', response(204)],
+    ['/tiles/v/12/0/0.png?optional=1', response()],
+    ['/tiles/v/11/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.6, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('fallback/v/13/1/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 13);
+  viewer.setTargets([{x: 0, y: 0, world: 0}, {x: 1, y: 0, world: 0}]);
+
+  assert.equal(await viewer.performRefresh('v', 13, 'sig', true), true);
+  const fb = layer.tiles.get('fallback/v/13/1/0@0');
+  assert.ok(fb, 'completion sweep removed the retained fallback of a live cell');
+  assert.equal(fb.hidden, false, 'completion sweep re-hid the settled fallback');
+  assert.equal(layer.tiles.get('v/13/0/0@0')?.hidden, false, 'sweep hid a loaded native');
+});
+
+test('settling at a lower level does not hide or evict retained z13 coverage', async () => {
+  const fetchResponses = new Map([
+    ['/tiles/v/10/0/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.4, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  // State left behind by a completed native session: revealed z13 children plus
+  // their retired coarse parents and a retained fallback for an empty tile.
+  layer.tiles.set('v/13/1/1@0', {hidden: false});
+  layer.tiles.set('v/13/-1/-1@0', {hidden: false});
+  layer.tiles.set('v/12/0/0@0', {hidden: true});
+  layer.tiles.set('fallback/v/13/2/2@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 13);
+  viewer.setTargets([{x: 0, y: 0, world: 0}]);
+
+  await viewer.performRefresh('v', 10, 'coarse', true);
+  assert.equal(layer.tiles.get('v/13/1/1@0')?.hidden, false, 'coarse settle hid live native coverage');
+  assert.equal(layer.tiles.get('v/13/-1/-1@0')?.hidden, false, 'coarse settle hid a visible sibling world copy');
+  assert.ok(layer.tiles.has('fallback/v/13/2/2@0'), 'coarse settle evicted retained empty-tile fallback');
 });
 
 test('aborted edge coverage does not hide completed center native tiles', async () => {
@@ -312,6 +414,24 @@ test('transient native failure shows z12 coverage but keeps the refresh incomple
   const settled = viewer.getState();
   assert.equal(settled.displayedLevel, 13);
   assert.equal(settled.lastViewportSignature, 'sigB');
+});
+
+test('intentional missing native tile with available parent coverage completes its transition', async () => {
+  const fetchResponses = new Map([
+    ['/tiles/v/13/-1/0.png?optional=1', response(204)],
+    ['/tiles/v/12/-1/0.png?optional=1', response()],
+  ]);
+  const viewer = loadViewerFunctions({zoom: 10.5, fetchResponses});
+  const layer = new viewer.MockPixelTileLayer();
+  viewer.setLayer(layer);
+  viewer.setState('v', 12);
+  viewer.setTargets([{x: -1, y: 0, world: 1}]);
+
+  assert.equal(await viewer.performRefresh('v', 13, 'native', true), true,
+    'a fully-covered region must complete even when every native tile is intentionally missing');
+  const settled = viewer.getState();
+  assert.equal(settled.displayedLevel, 13);
+  assert.equal(settled.lastViewportSignature, 'native');
 });
 
 test('intentional missing native tile retains its z12 transitional coverage', async () => {

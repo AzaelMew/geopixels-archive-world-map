@@ -20,7 +20,7 @@
   <script src="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
   <script src="/pixel-tile-layer.js"></script>
   <script>
-    const appVersion='1';
+    const appVersion='0.1.0';
     const gridSize=25,tileSize=256,maxDataZoom=13,earthRadius=6378137,mercatorHalfWorld=Math.PI*earthRadius;
     const params=new URLSearchParams(location.search);
     const select=document.querySelector('#version'),status=document.querySelector('#status');
@@ -251,8 +251,10 @@
       };
       const applyFallback=result=>{
         if(!result||!result.tile)return false;
-        if(generation!==refreshGeneration){result.tile.bitmap.close();return false}
-        pixelTileLayer.setTile(result.tile.key,result.tile.bitmap,result.tile.corners);result.tile.bitmap.close();
+        if(result.tile.key===fallbackKey)removeFallback();
+        if(generation!==refreshGeneration){closeFallbackResult(result);return false}
+        pixelTileLayer.setTile(result.tile.key,result.tile.bitmap,result.tile.corners);
+        closeBitmap(result.tile.bitmap);
         if(pixelTileLayer.hasTile(result.tile.key))touchLoadedTile(result.tile.key,visible,stage);
         if(coverageReady)coverageReady(result.tile.key);
         return true;
@@ -260,34 +262,47 @@
       const applyDetail=async result=>{
         if(!result||result.error)return false;
         if(generation!==refreshGeneration){if(result.bitmap)result.bitmap.close();return false}
-        if(result.blob===null){if(retainMissingFallback)return false;removeFallback();return true}
+        if(result.blob===null){
+          // ponytail: an intentional 204 counts as done only when fallback
+          // coverage exists (or is disallowed); otherwise the region would
+          // never complete and every refresh would restage it.
+          if(retainMissingFallback)return pixelTileLayer.hasTile(fallbackKey)||reusedFallback;
+          removeFallback();return true;
+        }
         const bitmap=result.bitmap;
         if(!bitmap)return false;
         pixelTileLayer.setTile(key,bitmap,nativeTileCorners(z,x,y,world));bitmap.close();
         if(pixelTileLayer.hasTile(key))touchLoadedTile(key,visible,stage);
         removeFallback();if(coverageReady)coverageReady(key);return true;
       };
+      const closeBitmap=bitmap=>{if(bitmap&&typeof bitmap.close==='function')bitmap.close()};
+      const closeFallbackResult=result=>{if(result&&result.tile&&result.tile.key!==fallbackKey)closeBitmap(result.tile.bitmap)};
       const first=await Promise.race([detailPromise,fallbackPromise]);
       if(generation!==refreshGeneration){
         if(first.kind==='fallback'){
-          if(first.tile)first.tile.bitmap.close();
-          background.push(detailPromise.then(result=>{if(result.bitmap)result.bitmap.close()}));
+          closeFallbackResult(first);
+          background.push(detailPromise.then(result=>{closeBitmap(result.bitmap)}));
         }else{
-          if(first.bitmap)first.bitmap.close();
-          background.push(fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()}));
+          closeBitmap(first.bitmap);
+          background.push(fallbackPromise.then(result=>{closeFallbackResult(result)}));
         }
         return false;
       }
       if(first.kind==='detail'){
         if(await applyDetail(first)){
-          background.push(fallbackPromise.then(result=>{if(result.tile)result.tile.bitmap.close()}));return true;
+          background.push(fallbackPromise.then(result=>{closeFallbackResult(result)}));return true;
         }
         // ponytail: never report a failed native tile as done just because z12 covered it;
         // recording completion would suppress all retries of that tile.
         const failedNative=first.error&&z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold;
         if(failedNative)return false;
         if(reusedFallback)return true;
-        return applyFallback(await fallbackPromise);
+        // ponytail: intentional 204 with no fallback either (204 all the way up)
+        // means the cell is genuinely empty — count it done instead of blocking
+        // completion forever; refreshes then sweep leftovers instead of restaging.
+        const fbResult=await fallbackPromise;
+        if(!fbResult?.tile&&first.blob===null&&retainMissingFallback&&!pixelTileLayer.hasTile(fallbackKey))return true;
+        return applyFallback(fbResult);
       }
       // ponytail: never report a failed native tile as done just because z12 covered it;
       // recording completion would suppress all retries of that tile.
@@ -315,6 +330,7 @@
     async function performRefresh(version,z,signature,allowFallback){
       const generation=++refreshGeneration;
       const fetches=new Map(),visible=new Set(),background=[];
+      const settledCoverage=new Set();
       const bounds=map.getBounds(),targets=prioritizeNativeTiles(visibleNativeTiles(bounds,z),z,bounds);
       const progressiveNative=z===maxDataZoom&&map.getZoom()>=nativeZoomThreshold;
       const transitionLevel=progressiveNative&&displayedLevel!==null&&displayedLevel<z?displayedLevel:null;
@@ -329,16 +345,29 @@
           let group=coverageGroups.get(groupId);
           if(!group){
             const parentKey=`${version}/${transitionLevel}/${parentX}/${parentY}@${world}`;
-            group={parentKeys:[parentKey,`fallback/${parentKey}`],targets:new Set(),ready:new Set(),current:new Map(),revealed:false};
+            group={parentKeys:[parentKey,`fallback/${parentKey}`],targets:new Set(),ready:new Set(),current:new Map(),revealed:false,settled:new Map()};
             coverageGroups.set(groupId,group);
           }
           group.targets.add(targetId);targetGroups.set(targetId,group);
-          for(const childKey of [`${version}/${z}/${x}/${y}@${world}`,`fallback/${version}/${z}/${x}/${y}@${world}`]){
+          const childBase=`${version}/${z}/${x}/${y}@${world}`;
+          // An earlier refresh may have already revealed this child (or its
+          // retained fallback): keep it settled instead of flashing coarse.
+          const live=pixelTileLayer.tiles.get(childBase)||pixelTileLayer.tiles.get(`fallback/${childBase}`);
+          if(live&&!live.hidden){group.settled.set(targetId,live);settledCoverage.add(live===pixelTileLayer.tiles.get(childBase)?childBase:`fallback/${childBase}`);continue}
+          for(const childKey of [childBase,`fallback/${childBase}`]){
             const entry=pixelTileLayer.tiles.get(childKey);if(entry)entry.hidden=true;
           }
         }
-        for(const group of coverageGroups.values())for(const parentKey of group.parentKeys){
-          const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=false;
+        for(const group of coverageGroups.values()){
+          if(group.settled.size===group.targets.size){
+            group.revealed=true;
+            for(const entry of group.settled.values())entry.hidden=false;
+            continue;
+          }
+          if(group.revealed)continue;
+          for(const parentKey of group.parentKeys){
+            const entry=pixelTileLayer.tiles.get(parentKey);if(entry)entry.hidden=false;
+          }
         }
       }
       const markCoverage=(targetId,key)=>{
@@ -368,9 +397,18 @@
       const complete=results.every(Boolean);
       if(!complete&&stage)return false;
       if(complete){
+        // ponytail: sweep hides/removes only entries at or below this refresh's
+        // level; already-native higher-level coverage survives coarse settles.
+        // settledCoverage spares already-revealed children/retained fallbacks of
+        // this refresh's own targets; everything else same-level or coarser gets
+        // re-judged so mid-gesture coarse leftovers can't linger on top.
         for(const [key,entry] of pixelTileLayer.tiles){
-          if(key.startsWith('fallback/')&&!visible.has(key)){pixelTileLayer.removeTile(key);tileUsage.delete(key);continue}
-          entry.hidden=!visible.has(key);
+          const seg=key.startsWith('fallback/')?key.slice('fallback/'.length):key;
+          const level=Number(seg.split('/')[1]);
+          if(level>z&&!visible.has(key))continue;
+          if(settledCoverage.has(key)||visible.has(key)){entry.hidden=false;continue}
+          if(key.startsWith('fallback/')&&level<=z){pixelTileLayer.removeTile(key);tileUsage.delete(key);continue}
+          entry.hidden=true;
         }
         displayedLevel=z;lastViewportSignature=signature;
         if(pixelTileLayer.map)pixelTileLayer.map.triggerRepaint();
