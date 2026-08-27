@@ -360,7 +360,13 @@
         // means the cell is genuinely empty — count it done instead of blocking
         // completion forever; refreshes then sweep leftovers instead of restaging.
         const fbResult=await fallbackPromise;
-        if(!fbResult?.tile&&first.blob===null&&retainMissingFallback&&!pixelTileLayer.hasTile(fallbackKey))return true;
+        if(!fbResult?.tile&&first.blob===null&&retainMissingFallback&&!pixelTileLayer.hasTile(fallbackKey)){
+          // Genuinely empty (204 up the chain) = transparent replacement
+          // coverage; the z11 retirement guard must count it or old coarse
+          // stays visible next to a still-failing sibling forever.
+          if(coverageReady)coverageReady(null);
+          return true;
+        }
         return applyFallback(fbResult);
       }
       // ponytail: never report a failed native tile as done just because z12 covered it;
@@ -462,9 +468,9 @@
         }
         markCoverage=(targetId,key)=>{
           const group=targetGroups.get(targetId);if(!group)return;
-          group.ready.add(targetId);group.current.set(targetId,key);
+          group.ready.add(targetId);if(key)group.current.set(targetId,key);
           const coarse=targetCoarseGroups.get(targetId);if(coarse)coarse.ready.add(targetId);
-          if(group.revealed){const entry=pixelTileLayer.tiles.get(key);if(entry)entry.hidden=false;return}
+          if(group.revealed){if(key){const entry=pixelTileLayer.tiles.get(key);if(entry)entry.hidden=false}return}
           if(coarse&&!coarse.revealed){
             if(coarse.ready.size!==coarse.targets.size)return;
             revealCoarse(coarse);

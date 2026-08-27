@@ -832,6 +832,56 @@ test('successful retry settles alongside a genuinely empty 204 region', async ()
     'successful mixed native/empty retry did not settle the viewport at z13');
 });
 
+test('genuinely empty 204 cell counts as replacement coverage next to a failing sibling', async () => {
+  // Same z11 parent: x=0 native ok, x=1 empty through z13/z12/z11,
+  // x=2 native keeps failing but its z12 fallback is ready. The z11
+  // transparency guard must retire the parent anyway.
+  const timers = [];
+  let failingAttempts = 0;
+  const fetchResponses = new Map([
+    ['/tiles/v/13/0/0.png?optional=1', response()],
+    ['/tiles/v/13/1/0.png?optional=1', response(204)],
+    ['/tiles/v/12/0/0.png?optional=1', response(204)],
+    ['/tiles/v/13/2/0.png?optional=1', () => {
+      failingAttempts++;
+      if (failingAttempts <= 1) throw new Error('down');
+      return response();
+    }],
+    ['/tiles/v/12/1/0.png?optional=1', response()],
+    ['/tiles/v/11/0/0.png?optional=1', response(204)],
+  ]);
+  const viewer = loadViewerFunctions({
+    zoom: 10.6,
+    fetchResponses,
+    setTimeoutOverride: (callback, delay) => {
+      if (delay >= 1000) { timers.push({callback, delay}); return timers.length; }
+      queueMicrotask(callback); return 1;
+    },
+  });
+  const layer = new viewer.MockPixelTileLayer();
+  layer.tiles.set('v/11/0/0@0', {hidden: false});
+  viewer.setLayer(layer);
+  viewer.setState('v', 11);
+  viewer.setTargets([{x: 0, y: 0, world: 0}, {x: 1, y: 0, world: 0}, {x: 2, y: 0, world: 0}]);
+
+  const refresh = viewer.scheduleTileRefresh(true);
+  await spinUntil(() => timers.length === 1 && layer.hasTile('fallback/v/13/2/0@0'),
+    'failing sibling never armed its retry or gained fallback coverage');
+
+  assert.equal(layer.tiles.get('v/11/0/0@0').hidden, true,
+    'z11 parent stayed visible although every visible cell had replacement coverage');
+  assert.equal(layer.tiles.get('v/13/0/0@0')?.hidden, false,
+    'ready native child was withheld by the empty sibling');
+  assert.equal(layer.tiles.get('fallback/v/13/2/0@0')?.hidden, false,
+    'transitional fallback was not revealed');
+  assert.equal(timers[0].delay, 2000, 'refresh reported complete despite the failed native');
+
+  timers.shift().callback();
+  await spinUntil(() => layer.hasTile('v/13/2/0@0'), 'recovered native never revealed');
+  await spinUntil(() => viewer.getState().displayedLevel === 13,
+    'retry success did not settle the viewport at z13');
+});
+
 test('new viewport receives a fresh retry budget after the old one is exhausted', async () => {
   const timers = [];
   let oldCalls = 0, newCalls = 0, newFlaky = true;
