@@ -359,7 +359,7 @@ func TestViewerUsesSignedNativeGridTilesAndExactCorners(t *testing.T) {
 		"activeRefresh.signature===coarseSignature",
 		"activeRefresh.promise.then(complete=>complete?true:",
 		"refreshTiles(coarseZ,true)",
-		"if(!complete||version!==archiveVersion",
+		"if(version!==archiveVersion||coarseSignature!==viewportSignature(coarseZ))return",
 		"touchLoadedTile(key,visible,stage)",
 		"const fallbackDelayMs=300",
 		"suppressFallback",
