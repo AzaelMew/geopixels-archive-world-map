@@ -26,8 +26,8 @@
     const select=document.querySelector('#version'),status=document.querySelector('#status');
     let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0,displayedLevel=null,lastViewportSignature='',activeRefresh=null;
     const maxCachedTiles=256;
-    const fallbackDelayMs=300;
-    const tileLoadConcurrency=16;
+    const fallbackDelayMs=500;
+    const tileLoadConcurrency=12;
     const moveRefreshDelayMs=100;
     const tileUsage=new Map();
     const missingTiles=new Set();
