@@ -187,7 +187,7 @@ test('native z13 transition remains at actual MapLibre zoom 10.5', () => {
 
 test('rendered credit uses the centrally defined application version', () => {
   const {appVersion, creditText} = loadViewerFunctions();
-  assert.equal(appVersion, '0.1.0');
+  assert.equal(appVersion, '0.1.1');
   assert.equal(creditText, `By Azael - V${appVersion}`);
 });
 
