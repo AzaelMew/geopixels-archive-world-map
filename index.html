@@ -27,7 +27,7 @@
     let pixelTileLayer=null,archiveVersion=null,refreshGeneration=0,displayedLevel=null,lastViewportSignature='',activeRefresh=null;
     const maxCachedTiles=256;
     const fallbackDelayMs=300;
-    const tileLoadConcurrency=4;
+    const tileLoadConcurrency=16;
     const moveRefreshDelayMs=100;
     const tileUsage=new Map();
     const missingTiles=new Set();

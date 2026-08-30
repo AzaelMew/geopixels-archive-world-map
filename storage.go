@@ -128,8 +128,8 @@ func OpenArchiveForServing(path string) (*Archive, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, err
